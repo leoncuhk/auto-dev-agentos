@@ -172,7 +172,20 @@ get_phase() {
   if [[ "$pending" -gt 0 ]]; then
     echo "work"
   else
-    echo "done"
+    # No pending work — check if target has been reached
+    local best target
+    best=$(jq '.best_metric // 0' "$PROJECT_DIR/.state/$STATE_FILE" 2>/dev/null || echo "0")
+    target=$(jq '.target_metric // 0' "$PROJECT_DIR/.state/$STATE_FILE" 2>/dev/null || echo "0")
+    # Use awk for float comparison (bash can't compare floats)
+    local reached
+    reached=$(awk "BEGIN { print ($best >= $target) ? 1 : 0 }")
+    if [[ "$reached" -eq 1 ]]; then
+      echo "done"
+    else
+      # Target not reached — cycle back to theorizer for new experiments
+      log "${YELLOW}All experiments completed but target not reached (best=$best < target=$target). Cycling to theorizer...${NC}" >&2
+      echo "init"
+    fi
   fi
 }
 

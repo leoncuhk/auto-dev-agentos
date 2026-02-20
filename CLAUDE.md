@@ -17,6 +17,8 @@ You are one session in a long-running autonomous pipeline. You have **NO memory*
 
 ## Workflow (every session)
 
+uv pip install <package>
+
 ### 1. Orient — Read state first (MANDATORY)
 
 ```bash

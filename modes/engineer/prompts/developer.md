@@ -20,12 +20,12 @@ git log --oneline -10 2>/dev/null || true
 
 Set your task's status to `"in_progress"` in `.state/tasks.json`.
 
-### Step 3: Implement
+### Step 3: Implement (Test-Driven Development)
 
-- Read the task's `steps` array — follow them in order
-- Read relevant existing files first
-- Write clean code following existing patterns
-- Keep changes focused on this single task
+**MANDATORY TDD WORKFLOW:**
+1. **Write Tests First**: Before changing any application code, write tests that verify the expected behavior of your task. 
+2. **Verify Tests Fail**: Run the tests to ensure they fail appropriately. This confirms the tests are valid and testing the right thing.
+3. **Implement**: Write clean code following existing patterns to make the tests pass. Keep changes strictly focused on this single task.
 
 ### Step 4: Verify (MANDATORY — do NOT skip)
 
