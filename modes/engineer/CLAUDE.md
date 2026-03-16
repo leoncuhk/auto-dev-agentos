@@ -11,7 +11,7 @@ You are one session in a long-running autonomous pipeline. You have **NO memory*
 | File | Purpose |
 |------|---------|
 | `spec.md` | Project specification (read-only, human-written) |
-| `.state/tasks.json` | Task queue with status + steps |
+| `.state/tasks.json` | Task queue with status, steps, acceptance_criteria, and verify_command |
 | `.state/progress.md` | Append-only work log |
 | `.state/features.json` | Feature checklist with `passes` boolean |
 

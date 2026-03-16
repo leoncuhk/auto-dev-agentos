@@ -88,3 +88,12 @@ todo-app/
 - Tests can be run with `npm test`
 - No external dependencies beyond Express (if used)
 
+### Verification
+
+Every feature must be verifiable via API calls or automated tests:
+- View todos: `curl -s localhost:3000/api/todos` returns JSON array
+- Add todo: `curl -s -X POST -H 'Content-Type: application/json' -d '{"title":"test"}' localhost:3000/api/todos` returns 201
+- Toggle todo: `curl -s -X PATCH localhost:3000/api/todos/1` returns 200
+- Delete todo: `curl -s -X DELETE localhost:3000/api/todos/1` returns 200
+- Persistence: todos survive server restart
+

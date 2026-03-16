@@ -29,7 +29,16 @@ Set your task's status to `"in_progress"` in `.state/tasks.json`.
 
 ### Step 4: Verify (MANDATORY — do NOT skip)
 
-**Run ALL checks. Fix ALL failures before proceeding.**
+**First, run the task-specific verification:**
+
+```bash
+# Read verify_command from the current task in tasks.json
+# Run it — this checks the acceptance_criteria for THIS specific task
+```
+
+If the task has a `verify_command`, run it. It must return exit code 0.
+
+**Then, run ALL global checks. Fix ALL failures before proceeding.**
 
 ```bash
 # 1. Build / typecheck
@@ -43,7 +52,7 @@ npm run lint 2>&1 || true
 ```
 
 If any check fails → fix the issue → re-run checks → repeat until clean.
-**Do NOT mark the task done until all checks pass.**
+**Do NOT mark the task done until both task-specific AND global checks pass.**
 
 ### Step 5: Update state
 

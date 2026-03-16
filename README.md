@@ -1,8 +1,10 @@
 # auto-dev-agentos
 
-**Autonomous Development Agent OS** — A minimal, mode-pluggable engine that uses LLM agents to develop projects or conduct algorithmic research autonomously.
+**Autonomous Development Agent OS** — A minimal, mode-pluggable engine that uses LLM agents to develop projects, conduct algorithmic research, or audit codebases autonomously.
 
-Give it a spec (or hypothesis), let it run. Come back to a working project (or a research report).
+Give it a spec (or hypothesis, or standards doc), let it run. Come back to a working project (or research report, or audit report).
+
+> **Core thesis**: Reliability in long-running AI agent tasks comes from *system discipline* — deterministic orchestration, stateless sessions, file-based state, mandatory verification — not from smarter models. See [the methodology article](articles/stateless-agent-architecture.md) for the full argument.
 
 ## Architecture
 
@@ -12,19 +14,19 @@ Give it a spec (or hypothesis), let it run. Come back to a working project (or a
                         │  Loop + Circuit Breaker + CLI     │
                         └───────────────┬──────────────────┘
                                         │
-                        ┌───────────────┴───────────────┐
-                        │                               │
-              ┌─────────▼─────────┐           ┌────────▼──────────┐
-              │  --mode engineer  │           │ --mode researcher  │
-              │  (Deductive)      │           │ (Inductive)        │
-              ├───────────────────┤           ├────────────────────┤
-              │ Entry: spec.md    │           │ Entry: hypothesis  │
-              │ State: tasks.json │           │ State: journal.json│
-              │ Pipeline:         │           │ Pipeline:          │
-              │  initializer →    │           │  theorizer →       │
-              │  developer →      │           │  executor →        │
-              │  reviewer         │           │  analyst           │
-              └───────────────────┘           └────────────────────┘
+              ┌─────────────────────────┼─────────────────────────┐
+              │                         │                         │
+    ┌─────────▼─────────┐   ┌──────────▼──────────┐   ┌─────────▼─────────┐
+    │  --mode engineer  │   │ --mode researcher   │   │  --mode auditor   │
+    │  (Deductive)      │   │ (Inductive)         │   │  (Systematic)     │
+    ├───────────────────┤   ├─────────────────────┤   ├───────────────────┤
+    │ Entry: spec.md    │   │ Entry: hypothesis.md│   │ Entry: standards  │
+    │ State: tasks.json │   │ State: journal.json │   │ State: findings   │
+    │ Pipeline:         │   │ Pipeline:           │   │ Pipeline:         │
+    │  initializer →    │   │  theorizer →        │   │  scanner →        │
+    │  developer →      │   │  executor →         │   │  auditor →        │
+    │  reviewer         │   │  analyst            │   │  reporter         │
+    └───────────────────┘   └─────────────────────┘   └───────────────────┘
 ```
 
 **Small core, pluggable brains.** The engine handles loop scheduling, session management, and circuit breaking. Mode-specific logic lives entirely in `modes/<name>/`.
@@ -53,6 +55,17 @@ hypothesis.md  →  [Theorizer]  →  journal.json + baseline
                                   Target metric achieved
 ```
 
+### Auditor Mode
+```
+standards.md  →  [Scanner]  →  findings.json + initial scan
+                                      ↓
+                                [Auditor]   ← loop (one finding per session)
+                                      ↓
+                                [Reporter]  ← every N sessions
+                                      ↓
+                                Audit report generated
+```
+
 ## Prerequisites
 
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) (`claude` command)
@@ -62,17 +75,18 @@ hypothesis.md  →  [Theorizer]  →  journal.json + baseline
 ## Quick Start
 
 ```bash
-# Engineer Mode — build a project from spec
+# Engineer: build a project from spec
 ./run.sh my-project
-./run.sh --mode engineer my-project
 
-# Researcher Mode — explore hypotheses
-./run.sh --mode researcher quant-lab
+# Researcher: run the quant-lab demo
+cd examples/quant-lab && python run_backtest.py  # verify baseline
+cd ../.. && ./run.sh --mode researcher examples/quant-lab
 
-# Limit sessions
+# Auditor: audit a codebase against standards
+./run.sh --mode auditor examples/audit-demo
+
+# Limit sessions / list modes
 ./run.sh --mode engineer my-project 20
-
-# List available modes
 ./run.sh --list-modes
 ```
 
@@ -111,17 +125,30 @@ auto-dev-agentos/
 │   │       ├── initializer.md     # Plan + scaffold
 │   │       ├── developer.md       # Implement one task
 │   │       └── reviewer.md        # Periodic review
-│   └── researcher/                # Inductive research workflow
-│       ├── mode.conf              # Mode configuration
-│       ├── CLAUDE.md              # Researcher-specific agent rules
+│   ├── researcher/                # Inductive research workflow
+│   │   ├── mode.conf
+│   │   ├── CLAUDE.md
+│   │   └── prompts/
+│   │       ├── theorizer.md       # Design experiment
+│   │       ├── executor.md        # Run experiment + evaluate
+│   │       └── analyst.md         # Periodic analysis
+│   └── auditor/                   # Systematic audit workflow
+│       ├── mode.conf
+│       ├── CLAUDE.md
 │       └── prompts/
-│           ├── theorizer.md       # Design experiment
-│           ├── executor.md        # Run experiment + evaluate
-│           └── analyst.md         # Periodic analysis
+│           ├── scanner.md         # Scan codebase for findings
+│           ├── auditor.md         # Deep-analyze one finding
+│           └── reporter.md        # Generate audit report
+├── articles/                      # Methodology & design rationale
 ├── prompts/                       # Legacy prompts (deprecated)
 └── examples/
     ├── todo-app/spec.md           # Engineer mode example
-    └── quant-lab/hypothesis.md    # Researcher mode example
+    ├── quant-lab/                  # Researcher mode example (complete demo)
+    │   ├── hypothesis.md          # Research goals
+    │   ├── run_backtest.py        # Runnable backtest script
+    │   ├── strategies.py          # Strategy implementations
+    │   └── .state/                # Pre-populated experiment journal
+    └── audit-demo/standards.md    # Auditor mode example
 ```
 
 ## Creating a New Mode
@@ -146,12 +173,23 @@ That's it. The engine picks up new modes automatically.
 
 ## Design Principles
 
-- **Minimal** — Shell script + markdown prompts. No Python framework, no complex tooling.
-- **Pluggable** — New modes = new directories. Zero engine changes required.
-- **Stateless sessions** — Each AI session starts fresh. All state lives in files.
-- **Circuit breaker** — Stuck detection, max sessions, graceful degradation.
-- **Small tasks** — Each unit of work is 10-30 minutes. Small = higher success rate.
-- **Verify before done** — Every change must pass validation before marking complete.
+These principles address the [six failure modes](https://arxiv.org/abs/2601.03315) documented in autonomous LLM research:
+
+| Principle | Addresses | How |
+|-----------|-----------|-----|
+| **Stateless sessions** | Context degradation | Each session starts fresh; no accumulated confusion |
+| **File-based state** | Context degradation | State survives across sessions without context window limits |
+| **One task per session** | Implementation drift | No room to progressively simplify under pressure |
+| **Mandatory verification** | Overexcitement | Metrics decide, not the LLM's self-assessment |
+| **Circuit breaker** | Infinite loops | Stuck detection + max sessions prevent runaway execution |
+| **Deterministic orchestration** | All six failure modes | Shell script decides flow, not LLM — predictable, auditable |
+| **Mode-pluggable** | — | New workflows = new directories, zero engine changes |
+| **Minimal** | — | 334 lines of shell + markdown prompts. No framework lock-in |
+
+## Further Reading
+
+- [**Methodology article**](articles/stateless-agent-architecture.md): Why stateless sessions and deterministic orchestration solve the reliability problem in long-running AI agent tasks
+- [**Quant-lab demo**](examples/quant-lab/): Complete researcher mode example with 6 experiments, journal, and progress log
 
 ## License
 

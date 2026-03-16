@@ -38,6 +38,8 @@ Break the project into **small, atomic tasks** (10-30 min each). Each task must 
       "priority": "high|medium|low",
       "dependencies": [],
       "status": "pending",
+      "acceptance_criteria": "Machine-verifiable condition, e.g. 'POST /api/todos returns 201 with JSON body containing id field'",
+      "verify_command": "Command to verify, e.g. 'npm test -- --grep TodoAPI' or 'curl -s localhost:3000/api/todos | jq .length'",
       "estimated_minutes": 15,
       "steps": [
         "Step 1: Create file X with Y",
@@ -48,6 +50,12 @@ Break the project into **small, atomic tasks** (10-30 min each). Each task must 
   ]
 }
 ```
+
+### Task Verification Fields
+
+Every task MUST include:
+- `acceptance_criteria`: A specific, machine-verifiable condition that defines "done". Not vague ("works correctly") but precise ("GET /api/todos returns 200 with JSON array").
+- `verify_command`: A shell command that returns exit code 0 when the criteria is met. This is what the developer agent runs to verify completion.
 
 **Task ordering (mandatory):**
 1. Project setup (package.json, config, directory structure)
