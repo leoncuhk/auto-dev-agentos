@@ -15,6 +15,7 @@ MAX_SESSIONS=50
 PAUSE_SEC="${PAUSE_SEC:-5}"
 REVIEW_INTERVAL="${REVIEW_INTERVAL:-5}"
 NO_PROGRESS_MAX="${NO_PROGRESS_MAX:-3}"
+DRY_RUN=0
 
 # ── CLI Parsing ──────────────────────────────────────────────────
 usage() {
@@ -25,6 +26,7 @@ Options:
   --mode <name>    Execution mode (default: engineer)
                    Loads prompts from modes/<name>/prompts/
   --list-modes     List available modes and exit
+  --dry-run        Show what would run without invoking Claude
   -h, --help       Show this help and exit
 
 Environment:
@@ -58,6 +60,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --mode)     MODE="$2"; shift 2 ;;
     --list-modes) list_modes ;;
+    --dry-run)  DRY_RUN=1; shift ;;
     -h|--help)  usage ;;
     -*)         echo "Unknown option: $1" >&2; exit 1 ;;
     *)          break ;;
@@ -66,6 +69,10 @@ done
 
 PROJECT_DIR="${1:?Usage: ./run.sh [--mode <mode>] <project-dir> [max-sessions]}"
 MAX_SESSIONS="${2:-$MAX_SESSIONS}"
+if ! [[ "$MAX_SESSIONS" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: Invalid max-sessions: '$MAX_SESSIONS'. Must be a number." >&2
+  exit 1
+fi
 
 # ── Resolve Paths ────────────────────────────────────────────────
 MODE_DIR="$SCRIPT_DIR/modes/$MODE"
@@ -116,10 +123,10 @@ err() { echo -e "${RED}[$(date '+%H:%M:%S')] ERROR:${NC} $*" >&2; }
 
 # ── Banner ───────────────────────────────────────────────────────
 echo -e "${GREEN}"
-echo "  ╔══════════════════════════════════════════════════╗"
-echo "  ║       auto-dev-agentos v${VERSION}                    ║"
-echo "  ║  Universal Autonomous Agent Engine               ║"
-echo "  ╚══════════════════════════════════════════════════╝"
+echo "  ╔════════════════════════════════════════════════╗"
+echo "  ║      auto-dev-agentos v${VERSION}                  ║"
+echo "  ║  Universal Autonomous Agent Engine            ║"
+echo "  ╚════════════════════════════════════════════════╝"
 echo -e "${NC}"
 log "Mode    : ${BOLD}${MODE}${NC}"
 log "Project : $PROJECT_DIR"
@@ -275,6 +282,48 @@ maybe_review() {
     log "Review complete → logs/review_${s}.log"
   fi
 }
+
+# ── Dry Run ──────────────────────────────────────────────────
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  log "${BOLD}[DRY RUN]${NC} No agents will be invoked."
+  echo ""
+
+  PHASE="$(get_phase)"
+  DONE="$(snapshot_progress)"
+
+  if [[ -f "$PROJECT_DIR/.state/$STATE_FILE" ]]; then
+    TOTAL=$(jq '(.tasks // .experiments // .findings // []) | length' "$PROJECT_DIR/.state/$STATE_FILE" 2>/dev/null || echo "0")
+  else
+    TOTAL=0
+  fi
+
+  # Resolve prompt
+  case "$PHASE" in
+    init)   PROMPT_NAME="$PHASE_INIT" ;;
+    work)   PROMPT_NAME="$PHASE_WORK" ;;
+    done)   PROMPT_NAME="(none — complete)" ;;
+    *)      PROMPT_NAME="$PHASE" ;;
+  esac
+  PROMPT_FILE="$MODE_DIR/prompts/${PROMPT_NAME}.md"
+
+  log "Phase     : ${YELLOW}${PHASE}${NC}"
+  log "Progress  : ${DONE}/${TOTAL} completed"
+  log "Entry file: $ENTRY_FILE $([ -f "$PROJECT_DIR/$ENTRY_FILE" ] && echo '(exists)' || echo "${RED}(MISSING)${NC}")"
+  log "State file: $STATE_FILE $([ -f "$PROJECT_DIR/.state/$STATE_FILE" ] && echo '(exists)' || echo '(will be created)')"
+  if [[ "$PHASE" == "done" ]]; then
+    log "Next prompt: ${GREEN}(none — all work complete)${NC}"
+  else
+    log "Next prompt: $(basename "$PROMPT_FILE") $([ -f "$PROMPT_FILE" ] && echo '(exists)' || echo "${RED}(MISSING)${NC}")"
+  fi
+
+  if [[ "$PHASE" != "done" && -f "$PROMPT_FILE" ]]; then
+    echo ""
+    log "Prompt preview (first 5 lines):"
+    head -5 "$PROMPT_FILE" | sed 's/^/  /'
+  fi
+
+  exit 0
+fi
 
 # ── Trap ─────────────────────────────────────────────────────────
 trap 'echo ""; log "Interrupted. State preserved in .state/"; exit 0' INT

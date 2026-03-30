@@ -67,7 +67,7 @@ The same principles apply to AI agent systems. I call this the **Stateless Agent
 
 Most agent frameworks let the LLM decide what to do next. This is fundamentally unreliable. An LLM deciding its own workflow is like letting a contractor decide which building code to follow — sometimes they'll get it right, but you can't *depend* on it.
 
-In auto-dev-agentos, a 334-line shell script (`run.sh`) controls the entire execution flow: which phase runs, when to review, when to stop, when to abort. The LLM only sees "here's your task, do it, report the result." The LLM has zero influence on the orchestration logic.
+In auto-dev-agentos, a small shell script (`run.sh`) controls the entire execution flow: which phase runs, when to review, when to stop, when to abort. The LLM only sees "here's your task, do it, report the result." The LLM has zero influence on the orchestration logic.
 
 This addresses **all six failure modes** at the architectural level — the agent literally cannot drift, loop, or skip steps because the orchestrator won't let it.
 

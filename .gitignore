@@ -1,4 +1,11 @@
 __pycache__/
 *.pyc
+*.egg-info/
 .DS_Store
+.venv/
+dist/
+build/
 logs/
+*.log
+# Runtime artifacts copied into project dirs by the engine
+examples/*/CLAUDE.md

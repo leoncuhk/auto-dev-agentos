@@ -1,96 +1,33 @@
-# auto-dev-agentos — Agent Workflow
+# auto-dev-agentos — Project Instructions
 
-> Auto-read by Claude Code. Defines rules for every agent session.
+> Auto-read by Claude Code when working on this repository.
 
-## Core Principle
+## What This Project Is
 
-You are one session in a long-running autonomous pipeline. You have **NO memory** of previous sessions. All state lives in files. Each session = fresh context.
+A minimal, mode-pluggable engine for autonomous LLM agent tasks. Two engines:
+- `run.sh` (~380 lines of shell) — single-loop, zero dependencies
+- `run.py` (~400 lines of Python) — dual-loop with SDK hooks
 
-## State Files
+## Architecture
 
-| File | Purpose |
-|------|---------|
-| `spec.md` | Project specification (read-only, human-written) |
-| `.state/tasks.json` | Task queue with status + steps |
-| `.state/progress.md` | Append-only work log |
-| `.state/features.json` | Feature checklist with `passes` boolean |
+- `core.py` — shared pure functions (config loading, phase detection, status counting)
+- `run.sh` / `run.py` — engines (orchestration loop, session execution)
+- `modes/<name>/` — mode-specific logic (mode.conf + CLAUDE.md + prompts/)
+- `tests/test_run.py` — unit tests for core.py functions
 
-## Workflow (every session)
+## Working on This Codebase
 
-uv pip install <package>
+- Run tests: `python3 tests/test_run.py`
+- Syntax check: `bash -n run.sh && python3 -c "import ast; ast.parse(open('run.py').read())"`
+- Smoke test: `./run.sh --dry-run examples/todo-app`
+- Both engines must stay under 500 lines each
+- New mode.conf keys must be ignored by run.sh (backward compatibility)
+- Pure functions go in core.py, not in run.py
 
-### 1. Orient — Read state first (MANDATORY)
+## Key Design Rules
 
-```bash
-cat spec.md
-cat .state/tasks.json
-tail -50 .state/progress.md
-git log --oneline -10 2>/dev/null || true
-```
-
-### 2. Act — Do ONE task only
-
-- Pick the first `"status": "pending"` task
-- Set it to `"in_progress"` immediately
-- Implement it following the task's `steps` array
-- Keep changes small and focused
-
-### 3. Verify — Mandatory feedback loops
-
-**Run ALL checks before committing. Do NOT skip any.**
-
-```bash
-# Build / typecheck
-npm run build 2>&1 || npx tsc --noEmit 2>&1 || true
-# Tests
-npm test 2>&1 || true
-# Lint
-npm run lint 2>&1 || true
-```
-
-If any check fails, **fix the issue first**. Do not commit broken code.
-
-### 4. Record — Update state files
-
-- Set task status to `"done"` in `.state/tasks.json`
-- Append to `.state/progress.md`:
-  ```
-  ## Session [N] — [timestamp]
-  **Task**: T[id] — [title]
-  **Done**: [what was accomplished]
-  **Verified**: [which checks passed]
-  **Issues**: [problems, or "none"]
-  **Next**: [what next session should do]
-  ```
-- Update `.state/features.json` if a feature now passes
-
-### 5. Update Learnings
-
-Append any discoveries to the `## Learnings` section at the bottom of this file:
-- Patterns discovered ("this project uses X for Y")
-- Gotchas ("when changing X, must also update Y")
-- Useful context ("the main API routes are in server.js")
-
-### 6. Commit
-
-```bash
-git add -A
-git commit -m "feat(T[id]): [task title] — verified"
-```
-
-### 7. Stop
-
-After ONE task, stop. The orchestrator starts a new session with fresh context.
-
-## Rules
-
-1. **One task per session** — Never attempt multiple tasks
-2. **Verify before done** — Untested code must not be marked done
-3. **Never delete tasks** — Only change status forward
-4. **Keep code working** — Every commit = buildable state
-5. **Respect existing patterns** — Follow conventions already in the project
-6. **If stuck** — Write `BLOCKED:` in progress.md and stop immediately
-
-## Learnings
-
-<!-- Agents append discoveries here. Future sessions benefit from this knowledge. -->
+1. **Stateless sessions** — each LLM call starts fresh, state lives in files
+2. **Deterministic orchestration** — shell/Python decides flow, not LLM
+3. **One task per session** — no multi-task sessions
+4. **Mandatory verification** — metrics decide, not LLM self-assessment
+5. **Minimal** — no frameworks, no Docker, no magic
