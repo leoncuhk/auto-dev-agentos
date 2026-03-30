@@ -147,6 +147,7 @@ Replace `claude -p` in `run.sh` with your CLI tool. The architecture is LLM-agno
 
 **Design:**
 - [Design Rationale](docs/design-rationale.md) — Why this architecture, what alternatives were considered
+- [Peirce's Inquiry Cycle](docs/peirce-inquiry-cycle.md) — Why three roles per mode is logically irreducible
 - [Stateless Agent Architecture](docs/stateless-agent-architecture.md) — Full argument for stateless sessions
 - [Dual-Loop Architecture](docs/dual-loop-architecture.md) — Strategic orientation via OODA outer loop
 
