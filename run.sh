@@ -135,12 +135,22 @@ log "Review  : every $REVIEW_INTERVAL sessions"
 echo ""
 
 # ── Prerequisites ────────────────────────────────────────────────
-for cmd in claude jq; do
-  if ! command -v "$cmd" &>/dev/null; then
-    err "$cmd not found. Required dependency."
-    exit 1
-  fi
-done
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  # Dry run only needs jq, not claude
+  for cmd in jq; do
+    if ! command -v "$cmd" &>/dev/null; then
+      err "$cmd not found. Required dependency."
+      exit 1
+    fi
+  done
+else
+  for cmd in claude jq; do
+    if ! command -v "$cmd" &>/dev/null; then
+      err "$cmd not found. Required dependency."
+      exit 1
+    fi
+  done
+fi
 
 # ── Copy CLAUDE.md (mode-specific) ───────────────────────────────
 if [[ ! -f "$PROJECT_DIR/CLAUDE.md" ]]; then
