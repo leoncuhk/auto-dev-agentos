@@ -3,19 +3,26 @@
 Quant Lab — Backtest Runner
 Runs the active strategy and outputs the Sharpe Ratio metric.
 Output format: [Metric] Sharpe Ratio: <float>
+
+Supports train/test split for hidden out-of-sample verification:
+  python run_backtest.py              # all data (default)
+  python run_backtest.py --split train  # first 70% (visible to LLM)
+  python run_backtest.py --split test   # last 30% (hidden from LLM)
 """
+import argparse
 import numpy as np
 import pandas as pd
 from strategies import active_strategy
 
 SEED = 38
+N_DAYS = 500
+TRAIN_RATIO = 0.7
 
 
-def generate_price_data(n_days=500):
+def generate_price_data(n_days=N_DAYS):
     """Generate synthetic price data with momentum and cyclical patterns."""
     np.random.seed(SEED)
     returns = np.random.normal(0.0005, 0.015, n_days)
-    # Momentum effect — makes trend-following strategies viable
     for i in range(1, n_days):
         returns[i] += 0.15 * returns[i - 1]
     prices = 100 * np.cumprod(1 + returns)
@@ -44,7 +51,21 @@ def run_backtest(data, strategy_func):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Quant Lab Backtest Runner")
+    parser.add_argument(
+        "--split", choices=["train", "test", "all"], default="all",
+        help="Data split: train (first 70%%), test (last 30%%), or all"
+    )
+    args = parser.parse_args()
+
     data = generate_price_data()
+
+    split_point = int(len(data) * TRAIN_RATIO)
+    if args.split == "train":
+        data = data.iloc[:split_point].reset_index(drop=True)
+    elif args.split == "test":
+        data = data.iloc[split_point:].reset_index(drop=True)
+
     strategy_returns = run_backtest(data, active_strategy)
     sharpe = calculate_sharpe(strategy_returns)
     print(f"[Metric] Sharpe Ratio: {sharpe:.4f}")

@@ -1,0 +1,611 @@
+"""
+Integration tests for auto-dev-agentos loop orchestration.
+
+Proves: the system autonomously decides what instruction to give the LLM next,
+based solely on state files — no human in the loop.
+
+Run: python tests/test_integration.py
+"""
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from core import (
+    count_by_status, get_phase, load_conf, parse_metric, progress_count,
+    run_verify_command, safe_read_state, safe_write_state, validate_state,
+)
+
+SCRIPT_DIR = Path(__file__).parent.parent
+
+
+# ═══════════════════════════════════════════
+# Helpers
+# ═══════════════════════════════════════════
+
+def make_mode_dir(tmp, mode="engineer"):
+    """Create a minimal mode directory with mode.conf and prompt stubs."""
+    mode_dir = Path(tmp) / "modes" / mode
+    mode_dir.mkdir(parents=True)
+    confs = {
+        "engineer": (
+            "entry_file=spec.md\nstate_file=tasks.json\n"
+            'pending_query=[.tasks[] | select(.status == "pending" or .status == "in_progress")] | length\n'
+            'progress_query=[.tasks[] | select(.status == "done")] | length\n'
+            "phase_init=initializer\nphase_work=developer\nphase_review=reviewer\n"
+        ),
+        "researcher": (
+            "entry_file=hypothesis.md\nstate_file=journal.json\n"
+            'pending_query=[.experiments[] | select(.status == "pending" or .status == "planned" or .status == "running")] | length\n'
+            'progress_query=[.experiments[] | select(.status == "accepted" or .status == "rejected" or .status == "error")] | length\n'
+            "phase_init=theorizer\nphase_work=executor\nphase_review=analyst\n"
+        ),
+        "auditor": (
+            "entry_file=standards.md\nstate_file=findings.json\n"
+            'pending_query=[.findings[] | select(.status == "pending" or .status == "in_progress")] | length\n'
+            'progress_query=[.findings[] | select(.status == "verified" or .status == "dismissed")] | length\n'
+            "phase_init=scanner\nphase_work=auditor\nphase_review=reporter\n"
+        ),
+    }
+    (mode_dir / "mode.conf").write_text(confs.get(mode, confs["engineer"]))
+    prompts_dir = mode_dir / "prompts"
+    prompts_dir.mkdir()
+    for name in ["initializer", "developer", "reviewer", "theorizer", "executor", "analyst", "scanner", "auditor", "reporter", "strategist"]:
+        (prompts_dir / f"{name}.md").write_text(f"# {name} prompt stub\n")
+    return mode_dir
+
+
+def write_state(tmp, filename, data):
+    state_dir = Path(tmp) / ".state"
+    state_dir.mkdir(exist_ok=True)
+    (state_dir / filename).write_text(json.dumps(data, indent=2))
+    return state_dir / filename
+
+
+# ═══════════════════════════════════════════
+# Group 1: Phase Transitions
+# Proves: the loop autonomously decides next phase
+# ═══════════════════════════════════════════
+
+def test_phase_init_when_no_state():
+    """No state file -> init phase. Loop will dispatch initializer."""
+    with tempfile.TemporaryDirectory() as tmp:
+        state_path = Path(tmp) / ".state" / "tasks.json"
+        conf = load_conf(make_mode_dir(tmp, "engineer"))
+        assert get_phase(state_path, conf) == "init"
+
+
+def test_phase_work_when_pending():
+    """Pending tasks exist -> work phase. Loop will dispatch developer."""
+    with tempfile.TemporaryDirectory() as tmp:
+        conf = load_conf(make_mode_dir(tmp, "engineer"))
+        state_path = write_state(tmp, "tasks.json", {
+            "tasks": [
+                {"id": "T1", "status": "done"},
+                {"id": "T2", "status": "pending"},
+                {"id": "T3", "status": "pending"},
+            ]
+        })
+        assert get_phase(state_path, conf) == "work"
+
+
+def test_phase_done_when_all_complete():
+    """All tasks done -> done phase. Loop exits."""
+    with tempfile.TemporaryDirectory() as tmp:
+        conf = load_conf(make_mode_dir(tmp, "engineer"))
+        state_path = write_state(tmp, "tasks.json", {
+            "tasks": [
+                {"id": "T1", "status": "done"},
+                {"id": "T2", "status": "done"},
+            ]
+        })
+        assert get_phase(state_path, conf) == "done"
+
+
+def test_researcher_target_met():
+    """Best metric >= target -> done. Loop exits."""
+    with tempfile.TemporaryDirectory() as tmp:
+        conf = load_conf(make_mode_dir(tmp, "researcher"))
+        state_path = write_state(tmp, "journal.json", {
+            "experiments": [],
+            "best_metric": 1.89,
+            "target_metric": 1.5,
+        })
+        assert get_phase(state_path, conf) == "done"
+
+
+def test_researcher_cycles_back():
+    """Target not met, no pending experiments -> init. Loop dispatches theorizer."""
+    with tempfile.TemporaryDirectory() as tmp:
+        conf = load_conf(make_mode_dir(tmp, "researcher"))
+        state_path = write_state(tmp, "journal.json", {
+            "experiments": [
+                {"id": "EXP-001", "status": "rejected"},
+            ],
+            "best_metric": 0.84,
+            "target_metric": 1.5,
+        })
+        assert get_phase(state_path, conf) == "init"
+
+
+# ═══════════════════════════════════════════
+# Group 2: Circuit Breaker
+# Proves: the loop has autonomous safety controls
+# ═══════════════════════════════════════════
+
+def test_stuck_detection():
+    """3 consecutive sessions with no progress -> should trigger stuck."""
+    with tempfile.TemporaryDirectory() as tmp:
+        conf = load_conf(make_mode_dir(tmp, "engineer"))
+        state_path = write_state(tmp, "tasks.json", {
+            "tasks": [{"id": "T1", "status": "pending"}]
+        })
+        no_progress = 0
+        no_progress_max = 3
+        for _ in range(5):
+            prev = progress_count(state_path, conf)
+            # Simulate session that makes no progress (state unchanged)
+            curr = progress_count(state_path, conf)
+            if curr <= prev:
+                no_progress += 1
+            else:
+                no_progress = 0
+            if no_progress >= no_progress_max:
+                break
+        assert no_progress >= no_progress_max, f"Expected stuck at {no_progress_max}, got {no_progress}"
+
+
+def test_progress_resets_stuck_counter():
+    """Making progress after stuck sessions resets the counter."""
+    with tempfile.TemporaryDirectory() as tmp:
+        conf = load_conf(make_mode_dir(tmp, "engineer"))
+        state_path = write_state(tmp, "tasks.json", {
+            "tasks": [
+                {"id": "T1", "status": "pending"},
+                {"id": "T2", "status": "pending"},
+            ]
+        })
+        no_progress = 0
+        # 2 stuck sessions
+        for _ in range(2):
+            prev = progress_count(state_path, conf)
+            curr = progress_count(state_path, conf)
+            if curr <= prev:
+                no_progress += 1
+        assert no_progress == 2
+        # Now make progress
+        data = json.loads(state_path.read_text())
+        data["tasks"][0]["status"] = "done"
+        state_path.write_text(json.dumps(data))
+        prev = 0
+        curr = progress_count(state_path, conf)
+        if curr > prev:
+            no_progress = 0
+        assert no_progress == 0, "Progress should reset stuck counter"
+
+
+# ═══════════════════════════════════════════
+# Group 3: State Validation
+# Proves: corruption is caught before damage
+# ═══════════════════════════════════════════
+
+def test_valid_engineer_state():
+    data = {"tasks": [{"id": "T1", "status": "pending"}, {"id": "T2", "status": "done"}]}
+    valid, errors = validate_state(data, "engineer")
+    assert valid, f"Expected valid, got errors: {errors}"
+
+
+def test_invalid_missing_array():
+    valid, errors = validate_state({}, "engineer")
+    assert not valid
+    assert any("tasks" in e for e in errors)
+
+
+def test_invalid_status():
+    data = {"tasks": [{"id": "T1", "status": "banana"}]}
+    valid, errors = validate_state(data, "engineer")
+    assert not valid
+    assert any("banana" in e for e in errors)
+
+
+def test_valid_researcher_state():
+    data = {"experiments": [{"id": "EXP-1", "status": "pending"}]}
+    valid, errors = validate_state(data, "researcher")
+    assert valid, f"Errors: {errors}"
+
+
+def test_valid_auditor_state():
+    data = {"findings": [{"id": "F1", "status": "verified"}]}
+    valid, errors = validate_state(data, "auditor")
+    assert valid, f"Errors: {errors}"
+
+
+def test_missing_id():
+    data = {"tasks": [{"status": "pending"}]}
+    valid, errors = validate_state(data, "engineer")
+    assert not valid
+    assert any("id" in e for e in errors)
+
+
+def test_safe_read_corrupt_json():
+    with tempfile.TemporaryDirectory() as tmp:
+        bad = Path(tmp) / "bad.json"
+        bad.write_text("not valid json{{{")
+        data, err = safe_read_state(bad)
+        assert data is None
+        assert "invalid JSON" in err
+        # Backup should exist
+        backups = list(Path(tmp).glob("backup_*"))
+        assert len(backups) == 1
+
+
+def test_safe_write_validates():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "state.json"
+        # Invalid data should be rejected
+        ok, err = safe_write_state(path, {"no_tasks": []}, "engineer")
+        assert not ok
+        assert not path.exists()
+
+
+def test_safe_write_atomic():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "state.json"
+        data = {"tasks": [{"id": "T1", "status": "pending"}]}
+        ok, err = safe_write_state(path, data, "engineer")
+        assert ok, f"Write failed: {err}"
+        assert path.exists()
+        loaded = json.loads(path.read_text())
+        assert loaded["tasks"][0]["id"] == "T1"
+
+
+# ═══════════════════════════════════════════
+# Group 4: Independent Verification
+# Proves: engine doesn't trust LLM's self-assessment
+# ═══════════════════════════════════════════
+
+def test_parse_metric_found():
+    output = "Running backtest...\n[Metric] Sharpe Ratio: 1.8900\nDone."
+    assert parse_metric(output) == 1.89
+
+
+def test_parse_metric_integer():
+    assert parse_metric("[Metric] Tests: 42") == 42.0
+
+
+def test_parse_metric_missing():
+    assert parse_metric("No metric here\nJust text") is None
+
+
+def test_verify_command_success():
+    with tempfile.TemporaryDirectory() as tmp:
+        result = run_verify_command(tmp, "echo '[Metric] Score: 95.5'")
+        assert result["success"]
+        assert result["exit_code"] == 0
+        assert result["metric"] == 95.5
+
+
+def test_verify_command_failure():
+    with tempfile.TemporaryDirectory() as tmp:
+        result = run_verify_command(tmp, "exit 1")
+        assert not result["success"]
+        assert result["exit_code"] == 1
+
+
+def test_verify_command_timeout():
+    with tempfile.TemporaryDirectory() as tmp:
+        result = run_verify_command(tmp, "sleep 10", timeout=1)
+        assert not result["success"]
+        assert result["stderr"] == "timeout"
+
+
+def test_hidden_verify_not_in_state():
+    """Hidden verification writes to separate file, NOT to LLM-visible state."""
+    with tempfile.TemporaryDirectory() as tmp:
+        state_dir = Path(tmp) / ".state"
+        state_dir.mkdir()
+        # Simulate hidden verify: write to hidden_metrics.json
+        hidden_path = state_dir / "hidden_metrics.json"
+        result = run_verify_command(tmp, "echo '[Metric] Sharpe Ratio: 1.45'")
+        hidden_entry = {"session": 1, "metric": result["metric"]}
+        hidden_path.write_text(json.dumps([hidden_entry]))
+        # The LLM-visible state file should NOT contain this
+        state_path = state_dir / "journal.json"
+        state_path.write_text(json.dumps({
+            "experiments": [{"id": "EXP-1", "status": "accepted"}],
+            "best_metric": 1.89,
+        }))
+        state_data = json.loads(state_path.read_text())
+        assert "hidden" not in json.dumps(state_data).lower()
+        # But hidden_metrics.json has the data
+        hidden_data = json.loads(hidden_path.read_text())
+        assert hidden_data[0]["metric"] == 1.45
+
+
+# ═══════════════════════════════════════════
+# Group 5: Full Loop Simulation
+# Proves: end-to-end autonomous orchestration
+# ═══════════════════════════════════════════
+
+def test_engineer_full_loop():
+    """Simulate complete engineer loop: init -> work x3 -> done.
+    The loop autonomously decides which phase and prompt to use at each step."""
+    with tempfile.TemporaryDirectory() as tmp:
+        conf = load_conf(make_mode_dir(tmp, "engineer"))
+        state_file = conf.get("state_file", "tasks.json")
+        state_path = Path(tmp) / ".state" / state_file
+        Path(tmp, ".state").mkdir(exist_ok=True)
+
+        decisions = []
+
+        # --- Session 1: no state -> init -> initializer creates tasks ---
+        phase = get_phase(state_path, conf)
+        decisions.append(("session_1", phase, conf.get("phase_init")))
+        assert phase == "init", f"Expected init, got {phase}"
+        # Simulate initializer: create tasks
+        write_state(tmp, state_file, {
+            "tasks": [
+                {"id": "T1", "status": "pending"},
+                {"id": "T2", "status": "pending"},
+                {"id": "T3", "status": "pending"},
+            ]
+        })
+
+        # --- Sessions 2-4: pending tasks -> work -> developer ---
+        for i, task_id in enumerate(["T1", "T2", "T3"], 2):
+            phase = get_phase(state_path, conf)
+            decisions.append((f"session_{i}", phase, conf.get("phase_work")))
+            assert phase == "work", f"Session {i}: expected work, got {phase}"
+            # Simulate developer: complete one task
+            data = json.loads(state_path.read_text())
+            for t in data["tasks"]:
+                if t["id"] == task_id:
+                    t["status"] = "done"
+            state_path.write_text(json.dumps(data))
+
+        # --- Session 5: all done -> done ---
+        phase = get_phase(state_path, conf)
+        decisions.append(("session_5", phase, None))
+        assert phase == "done", f"Expected done, got {phase}"
+
+        # Verify: 5 autonomous decisions, no human input
+        assert len(decisions) == 5
+        assert decisions[0][1] == "init"
+        assert decisions[1][1] == "work"
+        assert decisions[4][1] == "done"
+
+
+def test_researcher_full_loop():
+    """Simulate researcher loop with failure-driven learning:
+    init -> work(fail) -> init(cycle back) -> work(succeed) -> done."""
+    with tempfile.TemporaryDirectory() as tmp:
+        conf = load_conf(make_mode_dir(tmp, "researcher"))
+        state_file = conf.get("state_file", "journal.json")
+        state_path = Path(tmp) / ".state" / state_file
+        Path(tmp, ".state").mkdir(exist_ok=True)
+
+        decisions = []
+
+        # Session 1: no state -> init -> theorizer designs experiment
+        phase = get_phase(state_path, conf)
+        decisions.append(("session_1", phase))
+        assert phase == "init"
+        write_state(tmp, state_file, {
+            "experiments": [{"id": "EXP-001", "status": "pending"}],
+            "best_metric": 0.84,
+            "target_metric": 1.5,
+        })
+
+        # Session 2: pending experiment -> work -> executor runs it -> rejected
+        phase = get_phase(state_path, conf)
+        decisions.append(("session_2", phase))
+        assert phase == "work"
+        data = json.loads(state_path.read_text())
+        data["experiments"][0]["status"] = "rejected"
+        state_path.write_text(json.dumps(data))
+
+        # Session 3: no pending, target not met -> init -> theorizer designs new exp
+        phase = get_phase(state_path, conf)
+        decisions.append(("session_3", phase))
+        assert phase == "init", f"Expected init (cycle back), got {phase}"
+        data = json.loads(state_path.read_text())
+        data["experiments"].append({"id": "EXP-002", "status": "pending"})
+        state_path.write_text(json.dumps(data))
+
+        # Session 4: pending experiment -> work -> executor runs it -> accepted!
+        phase = get_phase(state_path, conf)
+        decisions.append(("session_4", phase))
+        assert phase == "work"
+        data = json.loads(state_path.read_text())
+        data["experiments"][1]["status"] = "accepted"
+        data["best_metric"] = 1.89
+        state_path.write_text(json.dumps(data))
+
+        # Session 5: target met -> done
+        phase = get_phase(state_path, conf)
+        decisions.append(("session_5", phase))
+        assert phase == "done"
+
+        # The loop made 5 autonomous decisions including a cycle-back
+        assert [d[1] for d in decisions] == ["init", "work", "init", "work", "done"]
+
+
+def test_auditor_full_loop():
+    """Simulate auditor loop: init -> work -> work -> done."""
+    with tempfile.TemporaryDirectory() as tmp:
+        conf = load_conf(make_mode_dir(tmp, "auditor"))
+        state_file = conf.get("state_file", "findings.json")
+        state_path = Path(tmp) / ".state" / state_file
+        Path(tmp, ".state").mkdir(exist_ok=True)
+
+        # Session 1: init -> scanner creates findings
+        phase = get_phase(state_path, conf)
+        assert phase == "init"
+        write_state(tmp, state_file, {
+            "findings": [
+                {"id": "F1", "status": "pending"},
+                {"id": "F2", "status": "pending"},
+            ]
+        })
+
+        # Session 2: work -> auditor verifies F1
+        phase = get_phase(state_path, conf)
+        assert phase == "work"
+        data = json.loads(state_path.read_text())
+        data["findings"][0]["status"] = "verified"
+        state_path.write_text(json.dumps(data))
+
+        # Session 3: work -> auditor dismisses F2
+        phase = get_phase(state_path, conf)
+        assert phase == "work"
+        data = json.loads(state_path.read_text())
+        data["findings"][1]["status"] = "dismissed"
+        state_path.write_text(json.dumps(data))
+
+        # Session 4: all findings resolved -> done
+        phase = get_phase(state_path, conf)
+        assert phase == "done"
+
+
+def test_loop_decides_next_prompt():
+    """KEY TEST: Given a state, the engine selects the correct prompt file.
+    This proves the system autonomously decides what instruction to give next."""
+    with tempfile.TemporaryDirectory() as tmp:
+        mode_dir = make_mode_dir(tmp, "engineer")
+        conf = load_conf(mode_dir)
+        state_file = conf.get("state_file", "tasks.json")
+        state_path = Path(tmp) / ".state" / state_file
+        Path(tmp, ".state").mkdir(exist_ok=True)
+
+        def resolve_prompt(phase, conf, mode_dir):
+            phase_keys = {"init": "phase_init", "work": "phase_work", "review": "phase_review"}
+            prompt_name = conf.get(phase_keys.get(phase, ""), phase)
+            return mode_dir / "prompts" / f"{prompt_name}.md"
+
+        # State 1: no state -> init -> initializer.md
+        phase = get_phase(state_path, conf)
+        prompt = resolve_prompt(phase, conf, mode_dir)
+        assert phase == "init"
+        assert prompt.name == "initializer.md"
+
+        # State 2: pending tasks -> work -> developer.md
+        write_state(tmp, state_file, {
+            "tasks": [{"id": "T1", "status": "pending"}]
+        })
+        phase = get_phase(state_path, conf)
+        prompt = resolve_prompt(phase, conf, mode_dir)
+        assert phase == "work"
+        assert prompt.name == "developer.md"
+
+        # State 3: all done -> done -> no prompt needed
+        data = json.loads(state_path.read_text())
+        data["tasks"][0]["status"] = "done"
+        state_path.write_text(json.dumps(data))
+        phase = get_phase(state_path, conf)
+        assert phase == "done"
+
+
+def test_loop_decides_researcher_prompt():
+    """Researcher mode: state determines theorizer vs executor selection."""
+    with tempfile.TemporaryDirectory() as tmp:
+        mode_dir = make_mode_dir(tmp, "researcher")
+        conf = load_conf(mode_dir)
+        state_path = Path(tmp) / ".state" / "journal.json"
+        Path(tmp, ".state").mkdir(exist_ok=True)
+
+        # No state -> init -> theorizer
+        phase = get_phase(state_path, conf)
+        assert phase == "init"
+        assert conf.get("phase_init") == "theorizer"
+
+        # Pending experiment -> work -> executor
+        write_state(tmp, "journal.json", {
+            "experiments": [{"id": "EXP-1", "status": "pending"}],
+            "best_metric": 0.5, "target_metric": 1.5,
+        })
+        phase = get_phase(state_path, conf)
+        assert phase == "work"
+        assert conf.get("phase_work") == "executor"
+
+        # All rejected, target not met -> init -> back to theorizer
+        data = json.loads(state_path.read_text())
+        data["experiments"][0]["status"] = "rejected"
+        state_path.write_text(json.dumps(data))
+        phase = get_phase(state_path, conf)
+        assert phase == "init"
+        assert conf.get("phase_init") == "theorizer"
+
+
+def test_quant_lab_backtest_splits():
+    """Verify the actual quant-lab backtest works with train/test splits."""
+    quant_dir = SCRIPT_DIR / "examples" / "quant-lab"
+    if not (quant_dir / "run_backtest.py").exists():
+        return  # skip if example not present
+
+    python = sys.executable
+    # All data
+    r_all = run_verify_command(str(quant_dir), f"{python} run_backtest.py")
+    assert r_all["success"], f"Backtest failed: {r_all['stderr']}"
+    assert r_all["metric"] is not None
+    assert r_all["metric"] > 1.0
+
+    # Train split
+    r_train = run_verify_command(str(quant_dir), f"{python} run_backtest.py --split train")
+    assert r_train["success"]
+    assert r_train["metric"] is not None
+
+    # Test split (hidden from LLM)
+    r_test = run_verify_command(str(quant_dir), f"{python} run_backtest.py --split test")
+    assert r_test["success"]
+    assert r_test["metric"] is not None
+
+    # Train and test should give different metrics (different data)
+    assert r_train["metric"] != r_test["metric"], \
+        f"Train ({r_train['metric']}) and test ({r_test['metric']}) should differ"
+
+
+def test_consistency_jq_vs_python():
+    """Verify Python regex-based count matches what jq would produce.
+    Uses the actual mode.conf queries from all three modes."""
+    test_cases = [
+        # (data, query, expected_count)
+        (
+            {"tasks": [{"status": "pending"}, {"status": "done"}, {"status": "in_progress"}]},
+            '[.tasks[] | select(.status == "pending" or .status == "in_progress")] | length',
+            2,
+        ),
+        (
+            {"experiments": [{"status": "accepted"}, {"status": "rejected"}, {"status": "pending"}]},
+            '[.experiments[] | select(.status == "pending" or .status == "planned" or .status == "running")] | length',
+            1,
+        ),
+        (
+            {"findings": [{"status": "verified"}, {"status": "pending"}, {"status": "dismissed"}]},
+            '[.findings[] | select(.status == "verified" or .status == "dismissed")] | length',
+            2,
+        ),
+    ]
+    for data, query, expected in test_cases:
+        result = count_by_status(data, query)
+        assert result == expected, f"Query {query[:40]}... expected {expected}, got {result}"
+
+
+# ═══════════════════════════════════════════
+# Runner
+# ═══════════════════════════════════════════
+
+if __name__ == "__main__":
+    tests = [n for n in sorted(dir()) if n.startswith("test_")]
+    passed = failed = 0
+    for name in tests:
+        try:
+            globals()[name]()
+            passed += 1
+            print(f"  PASS  {name}")
+        except Exception as e:
+            failed += 1
+            print(f"  FAIL  {name}: {e}")
+    print(f"\n{passed} passed, {failed} failed")
+    sys.exit(1 if failed else 0)

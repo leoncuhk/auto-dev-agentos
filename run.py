@@ -4,20 +4,13 @@ auto-dev-agentos v4.0 — SDK-based Dual-Loop Engine
 
 Architecture: Outer OODA loop (strategic) + Inner SDK loop (tactical)
 Coexists with run.sh — same mode system, additional capabilities:
-  - Hooks for safety and audit
-  - Session cost tracking
-  - Pure Python (no jq dependency)
-  - Strategic Orient phase (OODA)
-
-Prerequisites:
-  pip install claude-agent-sdk
-  # Or: already logged into Claude Code (subscription auth)
+  - Hooks for safety and audit / Session cost tracking
+  - Pure Python (no jq dependency) / Strategic Orient phase (OODA)
 
 Usage:
   python run.py my-project
   python run.py --mode researcher examples/quant-lab
-  python run.py --mode auditor examples/audit-demo
-  python run.py --list-modes
+  python run.py --simulate my-project   # deterministic mock via sim_script.json
 """
 
 import asyncio
@@ -27,72 +20,54 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-try:
-    from claude_agent_sdk import (
-        query,
-        ClaudeAgentOptions,
-        HookMatcher,
-        ResultMessage,
-        AssistantMessage,
-    )
-except ImportError:
-    sys.exit(
-        "claude-agent-sdk not found.\n"
-        "  Install: pip install claude-agent-sdk\n"
-        "  Or use run.sh for the shell-based engine."
-    )
-
 SCRIPT_DIR = Path(__file__).parent
-VERSION = "4.0"
+VERSION = "4.1"
 COMPLETE_SIGNAL = "<promise>COMPLETE</promise>"
 
-# Pure utility functions (shared with tests via core.py)
-from core import load_conf, count_by_status, get_phase, progress_count
+from core import (
+    load_conf, count_by_status, get_phase, progress_count,
+    run_verify_command, parse_metric, safe_read_state, safe_write_state,
+)
 
+_sdk_available = False
+try:
+    from claude_agent_sdk import (
+        query, ClaudeAgentOptions, HookMatcher, ResultMessage, AssistantMessage,
+    )
+    _sdk_available = True
+except ImportError:
+    pass
 
 # ═══════════════════════════════════════════════════════════════
 # Hooks — SDK Safety Layer
-#
-# NOTE ON SECURITY MODEL:
-# safety_guard uses literal substring matching. It catches accidental
-# dangerous commands but is trivially bypassable (flag reordering,
-# variable expansion, nested shells, etc.). It is NOT a security
-# boundary. For production use, run in a sandboxed container.
-# The real safety comes from: deterministic orchestration (LLM doesn't
-# control flow), one-task-per-session (blast radius is small), and
-# git-versioned state (everything is reversible).
 # ═══════════════════════════════════════════════════════════════
 
 BLOCKED_PATTERNS = [
     "rm -rf /", "rm -rf ~", "rm -rf .",
-    "git push --force", "git push -f",
-    "DROP TABLE", "DROP DATABASE",
+    "git push --force", "git push -f", "DROP TABLE", "DROP DATABASE",
 ]
 
 
 def _deny(reason: str) -> dict:
-    return {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": reason,
-        }
-    }
+    return {"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "deny",
+        "permissionDecisionReason": reason,
+    }}
 
 
 async def safety_guard(input_data: dict, _tool_use_id, _ctx) -> dict:
-    """PreToolUse: block obviously dangerous Bash commands (best-effort)."""
+    """PreToolUse: block obviously dangerous Bash commands."""
     cmd = input_data.get("tool_input", {}).get("command", "")
-    for pattern in BLOCKED_PATTERNS:
-        if pattern in cmd:
-            return _deny(f"Blocked: {pattern}")
+    for p in BLOCKED_PATTERNS:
+        if p in cmd:
+            return _deny(f"Blocked: {p}")
     return {}
 
 
 async def orient_edit_guard(input_data: dict, _tool_use_id, _ctx) -> dict:
-    """PreToolUse: during orient phase, restrict Edit to .state/ files only."""
-    tool = input_data.get("tool_name", "")
-    if tool == "Edit":
+    """PreToolUse: orient phase can only edit .state/ files."""
+    if input_data.get("tool_name") == "Edit":
         path = input_data.get("tool_input", {}).get("file_path", "")
         if "/.state/" not in path:
             return _deny(f"Orient phase: can only edit .state/ files, not {path}")
@@ -100,49 +75,33 @@ async def orient_edit_guard(input_data: dict, _tool_use_id, _ctx) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════
-# Session Execution — Inner SDK Loop
+# Phase Configuration
 # ═══════════════════════════════════════════════════════════════
 
-# Phase-specific tool configuration.
-# NOTE: Under bypassPermissions, allowed_tools does NOT restrict access —
-# all tools are available. Use disallowed_tools to enforce hard blocks.
-# See: SDK permission chain — disallowed_tools overrides bypassPermissions.
 PHASE_CONF = {
-    "orient": {
-        # Orient can read + edit state files, but NOT run commands or create files.
-        # disallowed_tools is the ONLY way to enforce this under bypassPermissions.
-        "allowed_tools": ["Read", "Glob", "Grep", "Edit"],
-        "disallowed_tools": ["Bash", "Write"],
-        "hooks": {
-            "PreToolUse": [
-                HookMatcher(matcher="Edit", hooks=[orient_edit_guard]),
-            ],
-        },
-    },
-    "review": {
-        "allowed_tools": ["Read", "Glob", "Grep", "Edit", "Bash"],
-        "disallowed_tools": [],
-        "hooks": {
-            "PreToolUse": [
-                HookMatcher(matcher="Bash", hooks=[safety_guard]),
-            ],
-        },
-    },
-    "default": {
-        "allowed_tools": ["Read", "Edit", "Write", "Bash", "Glob", "Grep"],
-        "disallowed_tools": [],
-        "hooks": {
-            "PreToolUse": [
-                HookMatcher(matcher="Bash", hooks=[safety_guard]),
-            ],
-        },
-    },
+    "orient": {"allowed_tools": ["Read", "Glob", "Grep", "Edit"],
+               "disallowed_tools": ["Bash", "Write"], "hooks": {}},
+    "review": {"allowed_tools": ["Read", "Glob", "Grep", "Edit", "Bash"],
+               "disallowed_tools": [], "hooks": {}},
+    "default": {"allowed_tools": ["Read", "Edit", "Write", "Bash", "Glob", "Grep"],
+                "disallowed_tools": [], "hooks": {}},
 }
+if _sdk_available:
+    PHASE_CONF["orient"]["hooks"] = {
+        "PreToolUse": [HookMatcher(matcher="Edit", hooks=[orient_edit_guard])]}
+    PHASE_CONF["review"]["hooks"] = {
+        "PreToolUse": [HookMatcher(matcher="Bash", hooks=[safety_guard])]}
+    PHASE_CONF["default"]["hooks"] = {
+        "PreToolUse": [HookMatcher(matcher="Bash", hooks=[safety_guard])]}
 
 PHASE_KEYS = {
     "init": "phase_init", "work": "phase_work",
     "review": "phase_review", "orient": "phase_orient",
 }
+
+# ═══════════════════════════════════════════════════════════════
+# Session Execution — Real SDK + Simulated
+# ═══════════════════════════════════════════════════════════════
 
 
 async def run_session(
@@ -152,20 +111,15 @@ async def run_session(
     """Execute one agent session via SDK query()."""
     prompt_name = conf.get(PHASE_KEYS.get(phase, ""), phase)
     prompt_file = mode_dir / "prompts" / f"{prompt_name}.md"
-
     if not prompt_file.exists():
         return {"status": "skipped", "cost": 0.0, "turns": 0, "complete": False}
 
     result = {"status": "unknown", "cost": 0.0, "turns": 0, "complete": False}
     log_parts = []
-
     pc = PHASE_CONF.get(phase, PHASE_CONF["default"])
     opts_kwargs = dict(
-        allowed_tools=pc["allowed_tools"],
-        max_turns=max_turns,
-        cwd=str(project),
-        permission_mode="bypassPermissions",
-        hooks=pc["hooks"],
+        allowed_tools=pc["allowed_tools"], max_turns=max_turns,
+        cwd=str(project), permission_mode="bypassPermissions", hooks=pc["hooks"],
     )
     if pc["disallowed_tools"]:
         opts_kwargs["disallowed_tools"] = pc["disallowed_tools"]
@@ -197,10 +151,74 @@ async def run_session(
     return result
 
 
+async def run_simulated_session(
+    project: Path, mode_dir: Path, conf: dict,
+    phase: str, label: str, sim_script: list, sim_idx: int,
+) -> dict:
+    """Execute a simulated session from sim_script.json."""
+    result = {"status": "success", "cost": 0.0, "turns": 1, "complete": False}
+    entry = sim_script[sim_idx] if sim_idx < len(sim_script) else (
+        sim_script[-1] if sim_script else None)
+    if entry is None:
+        return {"status": "skipped", "cost": 0.0, "turns": 0, "complete": False}
+
+    state_changes = entry.get("state_changes", {})
+    if state_changes:
+        state_file = project / ".state" / conf.get("state_file", "tasks.json")
+        data = {}
+        if state_file.exists():
+            try:
+                data = json.loads(state_file.read_text())
+            except (json.JSONDecodeError, ValueError):
+                pass
+        for k, v in state_changes.items():
+            data[k] = v
+        state_file.write_text(json.dumps(data, indent=2) + "\n")
+
+    result["complete"] = entry.get("complete", False)
+    result["cost"] = entry.get("cost", 0.0)
+    result["status"] = entry.get("status", "success")
+    log_dir = project / "logs"
+    log_dir.mkdir(exist_ok=True)
+    (log_dir / f"session_{label}.log").write_text(
+        f"[SIMULATE] phase={phase} entry={json.dumps(entry)}")
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════
+# Verification — Orchestrator-Enforced
+# ═══════════════════════════════════════════════════════════════
+
+
+def run_post_session_verification(project: Path, conf: dict, phase: str,
+                                  session: int, log_prefix: str = ""):
+    """Run verify_command and hidden_verify_command after work sessions."""
+    if phase != "work":
+        return
+    verify_cmd = conf.get("verify_command", "")
+    if verify_cmd:
+        vr = run_verify_command(str(project), verify_cmd)
+        if not vr["success"]:
+            print(f"{log_prefix}[{ts()}] WARNING: Verification failed "
+                  f"- LLM may have reported false success (exit {vr['exit_code']})")
+    hidden_cmd = conf.get("hidden_verify_command", "")
+    if hidden_cmd:
+        hr = run_verify_command(str(project), hidden_cmd)
+        metrics_path = project / ".state" / "hidden_metrics.json"
+        existing = []
+        if metrics_path.exists():
+            try:
+                existing = json.loads(metrics_path.read_text())
+            except (json.JSONDecodeError, ValueError):
+                existing = []
+        existing.append({"session": session, "metric": hr.get("metric"),
+                         "timestamp": datetime.now(timezone.utc).isoformat()})
+        metrics_path.write_text(json.dumps(existing, indent=2) + "\n")
+
+
 # ═══════════════════════════════════════════════════════════════
 # Dual-Loop Engine
 # ═══════════════════════════════════════════════════════════════
-
 
 def ts() -> str:
     return datetime.now().strftime("%H:%M:%S")
@@ -208,6 +226,9 @@ def ts() -> str:
 
 async def engine(args):
     """Nested dual-loop: outer OODA (strategic) + inner SDK (tactical)."""
+    simulate = getattr(args, "simulate", False)
+    log_prefix = "[SIMULATE] " if simulate else ""
+
     mode_dir = SCRIPT_DIR / "modes" / args.mode
     if not mode_dir.is_dir():
         avail = [d.name for d in (SCRIPT_DIR / "modes").iterdir() if d.is_dir()]
@@ -223,7 +244,6 @@ async def engine(args):
     if not (project / entry).exists():
         sys.exit(f"No {entry} in {project}. Required for --mode {args.mode}.")
 
-    # Copy CLAUDE.md from mode if project doesn't have one
     if not (project / "CLAUDE.md").exists():
         src = mode_dir / conf.get("claude_md", "CLAUDE.md")
         if not src.exists():
@@ -233,25 +253,34 @@ async def engine(args):
 
     state_path = project / ".state" / conf.get("state_file", "tasks.json")
 
+    # Load simulation script
+    sim_script, sim_idx = [], 0
+    if simulate:
+        sim_path = project / ".state" / "sim_script.json"
+        if not sim_path.exists():
+            sys.exit(f"[SIMULATE] No sim_script.json in {project / '.state'}")
+        sim_script = json.loads(sim_path.read_text())
+
     # ── Banner ──
     print(f"\n  {'='*52}")
     print(f"       auto-dev-agentos v{VERSION} (SDK Engine)")
     print(f"    Nested Dual-Loop: OODA x SDK")
+    if simulate:
+        print(f"    [SIMULATE MODE - deterministic mock]")
     print(f"  {'='*52}\n")
-    print(f"  Mode    : {args.mode}")
-    print(f"  Project : {project}")
-    print(f"  Sessions: max {args.max_sessions}")
-    print(f"  Review  : every {args.review_interval} | Orient: every {args.orient_interval}\n")
+    print(f"  {log_prefix}Mode    : {args.mode}")
+    print(f"  {log_prefix}Project : {project}")
+    print(f"  {log_prefix}Sessions: max {args.max_sessions} | Budget: ${args.max_budget:.2f}")
+    print(f"  {log_prefix}Review  : every {args.review_interval} | Orient: every {args.orient_interval}\n")
 
     if args.dry_run:
         print(f"  [DRY RUN] No agents will be invoked.\n")
         phase = get_phase(state_path, conf)
         done = progress_count(state_path, conf)
-        total = done  # approximate
+        total = done
         if state_path.exists():
             try:
                 data = json.loads(state_path.read_text())
-                # Count all items in the primary array
                 for key in ["tasks", "experiments", "findings"]:
                     if key in data:
                         total = len(data[key])
@@ -261,129 +290,136 @@ async def engine(args):
         print(f"  Phase     : {phase}")
         print(f"  Progress  : {done}/{total} completed")
         print(f"  Entry file: {entry} {'(exists)' if (project / entry).exists() else '(MISSING)'}")
-        print(f"  State file: {conf.get('state_file', 'tasks.json')} {'(exists)' if state_path.exists() else '(will be created)'}")
-
-        # Show which prompt would be loaded
-        phase_keys_map = {"init": "phase_init", "work": "phase_work", "review": "phase_review", "orient": "phase_orient"}
-        prompt_name = conf.get(phase_keys_map.get(phase, ""), phase)
+        print(f"  State file: {conf.get('state_file', 'tasks.json')} "
+              f"{'(exists)' if state_path.exists() else '(will be created)'}")
+        prompt_name = conf.get(PHASE_KEYS.get(phase, ""), phase)
         prompt_file = mode_dir / "prompts" / f"{prompt_name}.md"
         print(f"  Next prompt: {prompt_file.name} {'(exists)' if prompt_file.exists() else '(MISSING)'}")
-
-        # Show tool permissions for this phase
         pc = PHASE_CONF.get(phase, PHASE_CONF["default"])
         print(f"  Tools     : {', '.join(pc['allowed_tools'])}")
         if pc.get("disallowed_tools"):
             print(f"  Blocked   : {', '.join(pc['disallowed_tools'])}")
         return
 
-    session = 0
-    no_progress = 0
-    total_cost = 0.0
+    session, no_progress, total_cost = 0, 0, 0.0
 
-    # ── Main Loop ──────────────────────────────────────────────
+    # ── Main Loop ──
     while True:
         session += 1
         if session > args.max_sessions:
-            print(f"[{ts()}] Max sessions ({args.max_sessions}). Stopping.")
+            print(f"{log_prefix}[{ts()}] Max sessions ({args.max_sessions}). Stopping.")
             break
 
         phase = get_phase(state_path, conf)
         if phase == "done":
-            print(f"[{ts()}] All work complete!")
+            print(f"{log_prefix}[{ts()}] All work complete!")
             break
 
         # ── OODA Orient (strategic review) ──
         if session > 1 and session % args.orient_interval == 0:
-            print(f"\n[{ts()}] == OODA Orient ==")
-            r = await run_session(
-                project, mode_dir, conf, "orient", f"orient_{session}", 15
-            )
+            print(f"\n{log_prefix}[{ts()}] == OODA Orient ==")
+            if simulate:
+                r = await run_simulated_session(
+                    project, mode_dir, conf, "orient", f"orient_{session}",
+                    sim_script, sim_idx)
+                sim_idx += 1
+            else:
+                r = await run_session(
+                    project, mode_dir, conf, "orient", f"orient_{session}", 15)
             total_cost += r["cost"]
             if r["status"] != "skipped":
-                print(f"[{ts()}] Orient: {r['status']} | ${r['cost']:.4f}")
-            # Re-check phase — strategist may have changed state
+                print(f"{log_prefix}[{ts()}] Orient: {r['status']} | ${r['cost']:.4f}")
             phase = get_phase(state_path, conf)
             if phase == "done":
-                print(f"[{ts()}] Orient determined: complete!")
+                print(f"{log_prefix}[{ts()}] Orient determined: complete!")
                 break
 
-        # Snapshot for stuck detection
         prev = progress_count(state_path, conf)
 
-        # Run init.sh before work sessions (matches run.sh behavior)
         if phase == "work":
             init_script = project / "init.sh"
             if init_script.exists():
-                subprocess.run(
-                    ["bash", str(init_script)],
-                    cwd=str(project),
-                    capture_output=True,
-                    timeout=60,
-                )
+                subprocess.run(["bash", str(init_script)], cwd=str(project),
+                               capture_output=True, timeout=60)
 
         # ── Tactical Session ──
-        print(f"\n[{ts()}] Session #{session} -- {phase} [{args.mode}]")
-        r = await run_session(
-            project, mode_dir, conf, phase, str(session), args.max_turns
-        )
+        print(f"\n{log_prefix}[{ts()}] Session #{session} -- {phase} [{args.mode}]")
+        if simulate:
+            r = await run_simulated_session(
+                project, mode_dir, conf, phase, str(session), sim_script, sim_idx)
+            sim_idx += 1
+        else:
+            r = await run_session(
+                project, mode_dir, conf, phase, str(session), args.max_turns)
         total_cost += r["cost"]
-        print(
-            f"[{ts()}] #{session}: {r['status']} | "
-            f"${r['cost']:.4f} | {r['turns']} turns | "
-            f"total ${total_cost:.4f}"
-        )
+        print(f"{log_prefix}[{ts()}] #{session}: {r['status']} | "
+              f"${r['cost']:.4f} | {r['turns']} turns | total ${total_cost:.4f}")
 
         if r["complete"]:
-            print(f"[{ts()}] Agent confirmed complete!")
+            print(f"{log_prefix}[{ts()}] Agent confirmed complete!")
             break
+
+        # ── Budget Cap ──
+        if total_cost >= args.max_budget:
+            print(f"{log_prefix}[{ts()}] Budget cap reached "
+                  f"(${total_cost:.4f} >= ${args.max_budget:.2f}). Stopping.")
+            break
+
+        # ── Orchestrator Verification ──
+        run_post_session_verification(project, conf, phase, session, log_prefix)
 
         # ── Circuit Breaker ──
         if phase == "work":
             curr = progress_count(state_path, conf)
             if curr <= prev:
                 no_progress += 1
-                print(f"[{ts()}] No progress ({no_progress}/{args.no_progress_max})")
+                print(f"{log_prefix}[{ts()}] No progress ({no_progress}/{args.no_progress_max})")
                 if no_progress >= args.no_progress_max:
-                    print(f"[{ts()}] Stuck. Stopping.")
+                    print(f"{log_prefix}[{ts()}] Stuck. Stopping.")
                     break
             else:
                 no_progress = 0
 
         # ── Tactical Review ──
         if session >= args.review_interval and session % args.review_interval == 0:
-            print(f"\n[{ts()}] == Tactical Review ==")
-            r = await run_session(
-                project, mode_dir, conf, "review", f"review_{session}", 20
-            )
+            print(f"\n{log_prefix}[{ts()}] == Tactical Review ==")
+            if simulate:
+                r = await run_simulated_session(
+                    project, mode_dir, conf, "review", f"review_{session}",
+                    sim_script, sim_idx)
+                sim_idx += 1
+            else:
+                r = await run_session(
+                    project, mode_dir, conf, "review", f"review_{session}", 20)
             total_cost += r["cost"]
-            print(f"[{ts()}] Review: {r['status']} | ${r['cost']:.4f}")
+            print(f"{log_prefix}[{ts()}] Review: {r['status']} | ${r['cost']:.4f}")
 
         await asyncio.sleep(args.pause)
 
-    # ── Summary ──
-    print(f"\n[{ts()}] Done. {args.mode} | {session} sessions | ${total_cost:.4f}")
+    print(f"\n{log_prefix}[{ts()}] Done. {args.mode} | {session} sessions | ${total_cost:.4f}")
 
 
 # ═══════════════════════════════════════════════════════════════
 # CLI
 # ═══════════════════════════════════════════════════════════════
 
-
 def main():
     import argparse
-
     p = argparse.ArgumentParser(
-        description=f"auto-dev-agentos v{VERSION} -- SDK Dual-Loop Engine"
-    )
+        description=f"auto-dev-agentos v{VERSION} -- SDK Dual-Loop Engine")
     p.add_argument("project_dir", nargs="?", help="Project directory")
     p.add_argument("--mode", default="engineer", help="Execution mode (default: engineer)")
     p.add_argument("--max-sessions", type=int, default=50)
     p.add_argument("--max-turns", type=int, default=50, help="Max LLM turns per session")
+    p.add_argument("--max-budget", type=float, default=10.0,
+                   help="Max total cost in USD (default: 10.0)")
     p.add_argument("--review-interval", type=int, default=5)
-    p.add_argument("--orient-interval", type=int, default=10, help="Strategic review interval")
+    p.add_argument("--orient-interval", type=int, default=10)
     p.add_argument("--no-progress-max", type=int, default=3)
     p.add_argument("--pause", type=int, default=5, help="Seconds between sessions")
-    p.add_argument("--dry-run", action="store_true", help="Show what would happen without running agents")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--simulate", action="store_true",
+                   help="Use .state/sim_script.json instead of real LLM calls")
     p.add_argument("--list-modes", action="store_true")
     args = p.parse_args()
 
@@ -398,6 +434,12 @@ def main():
     if not args.project_dir:
         p.print_help()
         return
+
+    if not args.simulate and not args.dry_run and not _sdk_available:
+        sys.exit("claude-agent-sdk not found.\n"
+                 "  Install: pip install claude-agent-sdk\n"
+                 "  Or use run.sh for the shell-based engine.\n"
+                 "  Or use --simulate for testing without SDK.")
 
     asyncio.run(engine(args))
 
