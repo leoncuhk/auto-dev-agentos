@@ -1,5 +1,24 @@
 # Changelog
 
+## [4.1.0] — 2026-06-21
+
+### Added
+- **Independent verification layer**: orchestrator runs `verify_command` after each work session, independently of LLM self-report
+- **Hidden out-of-sample validation**: `hidden_verify_command` in mode.conf runs on data invisible to the LLM, writes to `.state/hidden_metrics.json`
+- **State schema validation**: `validate_state()` rejects corrupt/invalid state with clear error messages
+- **Atomic state writes**: `safe_write_state()` validates before write, creates automatic backups, uses atomic `os.replace`
+- **Budget cap**: `--max-budget` (default $10) stops the loop when cost limit is exceeded
+- **Simulation mode**: `--simulate` runs the full orchestration loop using `.state/sim_script.json` — zero LLM calls, deterministic, testable
+- **Train/test split**: `run_backtest.py --split train|test` with independent random seed for genuinely out-of-sample data
+- **Integration tests**: 30 tests proving autonomous loop orchestration (phase transitions, circuit breaker, state validation, independent verification, full loop simulations)
+- **`metric_pattern`** key in researcher mode.conf
+
+### Changed
+- `run.py` version bumped to 4.1, SDK import now optional (not required for `--simulate` or `--dry-run`)
+- `core.py` expanded from 81 to 180 lines with verification and validation functions
+- CI now runs integration tests alongside unit tests, with numpy/pandas for backtest verification
+- README repositioned with Loop Engineering framing and verification documentation
+
 ## [4.0.0] — 2026-03-30
 
 ### Added

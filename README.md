@@ -4,9 +4,22 @@
 
 Write a spec. Run the loop. Get a verified project.
 
-A minimal, mode-pluggable engine that orchestrates LLM agents to develop projects, conduct algorithmic research, or audit codebases — autonomously.
+A minimal [Loop Engineering](https://addyosmani.com/blog/loop-engineering) engine that replaces you as the person prompting the agent. You design the system — the system prompts the LLM, verifies the output, decides what to do next, and stops when done.
 
-> **Core thesis**: Reliability in long-running AI agent tasks comes from *system discipline* — deterministic orchestration, stateless sessions, file-based state, mandatory verification — not from smarter models.
+> **Core thesis**: Reliability in long-running AI agent tasks comes from *system discipline* — deterministic orchestration, stateless sessions, independent verification, hidden out-of-sample validation — not from smarter models.
+
+## What This Is
+
+In the language of Loop Engineering (Osmani 2026, Cherny 2026):
+
+- The **outer loop** is `run.sh` / `run.py` — it decides what runs next
+- The **inner loop** is Claude Code — it executes one task per session
+- The **maker** is the LLM session — it writes code or proposes experiments
+- The **checker** is the orchestrator's `verify_command` — it independently validates
+- The **state** lives on disk (`.state/` JSON + markdown) — survives across sessions
+- The **stop conditions** are deterministic — target met, stuck detected, budget exceeded
+
+You write a spec (or hypothesis, or audit standards). The loop takes over.
 
 ## Architecture
 
@@ -21,6 +34,7 @@ Each session is stateless. State lives in `.state/` files. Session N+1 reads wha
 | On failure   | Fix and retry        | Revert and learn      | Dismiss with evidence    |
 | Exit when    | All tasks pass       | Target metric hit     | All standards covered    |
 | State file   | `tasks.json`         | `journal.json`        | `findings.json`          |
+| Verification | `npm test` / `pytest`| Backtest metric       | Coverage count           |
 
 ## Quick Start
 
@@ -34,7 +48,10 @@ cd auto-dev-agentos
 # Preview without invoking Claude (zero cost)
 ./run.sh --dry-run examples/todo-app
 
-# Write a spec, run the engine
+# Test the loop with simulation (no LLM calls, no cost)
+python run.py --simulate --mode engineer --pause 0 examples/todo-app
+
+# Write a spec, run the engine for real
 mkdir my-project && echo "# My App\nBuild a REST API..." > my-project/spec.md
 ./run.sh my-project
 ```
@@ -47,7 +64,7 @@ brew install jq                         # macOS (or: apt-get install jq)
 npm install -g @anthropic-ai/claude-code # Claude Code CLI
 ```
 
-**SDK engine** (`run.py` — adds strategic review, hooks, cost tracking):
+**SDK engine** (`run.py` — adds strategic review, hooks, cost tracking, simulation):
 ```bash
 pip install claude-agent-sdk            # Python 3.10+
 ```
@@ -59,15 +76,17 @@ pip install claude-agent-sdk            # Python 3.10+
 ./run.sh [--mode <mode>] [--dry-run] <project-dir> [max-sessions]
 
 # SDK engine
-python run.py [--mode <mode>] [--dry-run] <project-dir> [options]
+python run.py [--mode <mode>] [--dry-run] [--simulate] <project-dir> [options]
 ```
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--mode` | `engineer` | `engineer`, `researcher`, or `auditor` |
 | `--dry-run` | | Preview what would run, no LLM calls |
+| `--simulate` | | Use `.state/sim_script.json` for deterministic testing |
 | `--max-sessions` | `50` | Session limit |
-| `--orient-interval` | `10` | Strategic review interval (SDK engine only) |
+| `--max-budget` | `10.0` | Maximum cost in USD (SDK engine) |
+| `--orient-interval` | `10` | Strategic review interval (SDK engine) |
 
 | Env Variable | Default | Description |
 |-------------|---------|-------------|
@@ -91,23 +110,38 @@ The [quant-lab demo](examples/quant-lab/) shows a complete research run — opti
 Failed experiments (002, 003, 004) directly informed the winning experiment (005). The loop works because failures accumulate as knowledge, not waste.
 
 ```bash
-cd examples/quant-lab && python run_backtest.py   # verify: Sharpe = 1.89
-cat .state/journal.json                            # full experiment log
-cat .state/progress.md                             # session-by-session narrative
+cd examples/quant-lab
+python run_backtest.py                    # full data: Sharpe = 1.89
+python run_backtest.py --split train      # visible to LLM: Sharpe = 1.96
+python run_backtest.py --split test       # hidden OOS:     Sharpe = 1.67
 ```
+
+The train/test split enables hidden out-of-sample verification — the engine independently validates on data the LLM never sees, preventing overfitting.
+
+## Independent Verification
+
+The engine doesn't trust LLM self-assessment. After each work session:
+
+1. **`verify_command`** (from `mode.conf`) runs independently — the orchestrator checks the result
+2. **`hidden_verify_command`** runs on hidden test data — metric written to `.state/hidden_metrics.json`, never fed back to the LLM
+3. **State validation** — schema checks reject corrupt JSON before write, with automatic backup
+
+This implements the maker-checker split: the LLM proposes, deterministic code verifies.
 
 ## Project Structure
 
 ```
 auto-dev-agentos/
-├── run.sh              # Shell engine (single-loop)
-├── run.py              # SDK engine (dual-loop, hooks, cost tracking)
-├── core.py             # Shared pure functions
+├── run.sh              # Shell engine (single-loop, 393 lines)
+├── run.py              # SDK engine (dual-loop, simulation, 448 lines)
+├── core.py             # Shared pure functions (validation, verification)
 ├── modes/
 │   ├── engineer/       # spec.md → tasks → implement → verify
 │   ├── researcher/     # hypothesis.md → experiment → evaluate → learn
 │   └── auditor/        # standards.md → scan → analyze → report
-├── tests/              # Unit tests (no SDK dependency)
+├── tests/
+│   ├── test_run.py     # Unit tests (17 tests)
+│   └── test_integration.py  # Integration tests (30 tests)
 ├── docs/               # Design rationale and methodology
 └── examples/           # Demo projects (todo-app, quant-lab, audit-demo)
 ```
@@ -125,23 +159,31 @@ These address the [six failure modes](https://arxiv.org/abs/2601.03315) of auton
 | Stateless sessions | Context degradation — each session starts fresh |
 | File-based state | Context window limits — state survives indefinitely |
 | One task per session | Implementation drift — no room to simplify under pressure |
-| Mandatory verification | Overexcitement — metrics decide, not LLM self-assessment |
-| Circuit breaker | Infinite loops — stuck detection + max sessions |
-| Deterministic orchestration | All six — shell script decides flow, not LLM |
+| Independent verification | Overexcitement — orchestrator verifies, not LLM self-report |
+| Hidden OOS validation | Overfitting — test data invisible to the LLM |
+| Circuit breaker | Infinite loops — stuck detection + max sessions + budget cap |
+| Deterministic orchestration | All six — code decides flow, not LLM |
+| State schema validation | Corruption — rejects invalid state, auto-backups |
 
 ## FAQ
 
 **How much does it cost?**
-Each session is one Claude Code invocation. `--dry-run` previews at zero cost. `MAX_SESSIONS` caps total runs.
+Each session is one Claude Code invocation. `--dry-run` previews at zero cost. `--max-budget` caps total spend. `--simulate` runs the full loop with zero LLM calls.
+
+**How do I test without spending money?**
+Use `--simulate` mode with a `.state/sim_script.json` file. The entire orchestration loop runs identically — only the LLM call is mocked.
 
 **Why `--dangerously-skip-permissions`?**
 Headless mode — no human to click "approve." Safety comes from architecture: deterministic orchestration, one-task blast radius, git-versioned state, circuit breakers.
 
 **Can I resume after Ctrl+C?**
-Yes. Same command again. The engine re-reads `.state/` and continues.
+Yes. Same command again. The engine re-reads `.state/` and continues from where it left off.
 
 **Can I use a different LLM?**
 Replace `claude -p` in `run.sh` with your CLI tool. The architecture is LLM-agnostic; the current implementation uses Claude.
+
+**What's the relationship to Loop Engineering?**
+This project is a Loop Engineering implementation: it replaces the human who would otherwise prompt the agent at each step. The system autonomously decides what instruction to give the LLM next, based solely on state files.
 
 ## References
 
@@ -150,6 +192,11 @@ Replace `claude -p` in `run.sh` with your CLI tool. The architecture is LLM-agno
 - [Peirce's Inquiry Cycle](docs/peirce-inquiry-cycle.md) — Why three roles per mode is logically irreducible
 - [Stateless Agent Architecture](docs/stateless-agent-architecture.md) — Full argument for stateless sessions
 - [Dual-Loop Architecture](docs/dual-loop-architecture.md) — Strategic orientation via OODA outer loop
+
+**Loop Engineering:**
+- [Addy Osmani — Loop Engineering](https://addyosmani.com/blog/loop-engineering) — Canonical definition (June 2026)
+- [Boris Cherny — Claude Code & the Future of Engineering](https://x.com/AcquiredFM/status/2062621816393297920) — "My job is to write loops" (June 2026)
+- [LangChain — The Art of Loop Engineering](https://blog.langchain.dev/the-art-of-loop-engineering/) — Four-loop stack
 
 **Research:**
 - [Why LLMs Aren't Scientists Yet](https://arxiv.org/abs/2601.03315) — Six failure modes in autonomous LLM research (arXiv, 2026)
@@ -161,16 +208,13 @@ Replace `claude -p` in `run.sh` with your CLI tool. The architecture is LLM-agno
 - [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python) — Python SDK for agent loops
 - [GitHub Spec Kit](https://github.com/github/spec-kit) — Spec-driven development toolkit
 - [OpenHands](https://github.com/All-Hands-AI/OpenHands) — Full-platform autonomous coding agent
-- [SWE-agent](https://github.com/SWE-agent/SWE-agent) — GitHub issue resolution agent
+- [Omnigent](https://github.com/databricks/omnigent) — Meta-harness for composing agent loops
 - [Aider](https://github.com/Aider-AI/aider) — Interactive AI pair programming
 - [Sakana AI Scientist v2](https://github.com/SakanaAI/AI-Scientist-v2) — Autonomous research via tree search
-- [Gas Town](https://github.com/steveyegge/gastown) — Multi-agent parallel orchestration
-- [Goose](https://github.com/block/goose) — MCP-native extensible agent framework
-- [BMAD](https://github.com/24601/BMAD-AT-CLAUDE) — Multi-agent development method (26 agents)
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Run `python tests/test_run.py` before submitting.
+See [CONTRIBUTING.md](CONTRIBUTING.md). Run `python tests/test_run.py && python tests/test_integration.py` before submitting.
 
 ## License
 
