@@ -15,13 +15,14 @@ import pandas as pd
 from strategies import active_strategy
 
 SEED = 38
+TEST_SEED_OFFSET = 17
 N_DAYS = 500
 TRAIN_RATIO = 0.7
 
 
-def generate_price_data(n_days=N_DAYS):
+def generate_price_data(n_days=N_DAYS, seed_offset=0):
     """Generate synthetic price data with momentum and cyclical patterns."""
-    np.random.seed(SEED)
+    np.random.seed(SEED + seed_offset)
     returns = np.random.normal(0.0005, 0.015, n_days)
     for i in range(1, n_days):
         returns[i] += 0.15 * returns[i - 1]
@@ -64,6 +65,7 @@ def main():
     if args.split == "train":
         data = data.iloc[:split_point].reset_index(drop=True)
     elif args.split == "test":
+        data = generate_price_data(seed_offset=TEST_SEED_OFFSET)
         data = data.iloc[split_point:].reset_index(drop=True)
 
     strategy_returns = run_backtest(data, active_strategy)
