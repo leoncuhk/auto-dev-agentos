@@ -146,6 +146,47 @@ auto-dev-agentos/
 └── examples/           # Demo projects (todo-app, quant-lab, audit-demo)
 ```
 
+## Experimental Validation
+
+We tested three properties of the loop via simulation and deterministic backtests. Full methodology and code: [`experiments/run_validation.py`](experiments/run_validation.py).
+
+Run it yourself: `python experiments/run_validation.py`
+
+### What was tested
+
+**Experiment 1 — Convergence**: Does the loop reach its target regardless of how many experiments fail along the way? Tested with 4 simulated exploration paths (lucky, typical, hard, pathological).
+
+**Experiment 2 — Generalization**: Does the strategy discovered by the loop (on one data seed) outperform the baseline it started from when tested on 12 different random seeds?
+
+**Experiment 3 — Autonomous correctness**: Does the engine make the right phase decision (init/work/done) across all state configurations, without human input?
+
+### Results
+
+| Hypothesis | Result | Key number |
+|---|---|---|
+| H1: Loop converges on viable paths | **Pass** | 3/3 viable paths reached target; pathological path halted by circuit breaker |
+| H2: Improvement generalizes to unseen data | **Pass** | Loop-discovered strategy beats baseline on 7/12 seeds (58%) |
+| H3: Autonomous decisions are correct | **Pass** | 7/7 scenarios, 100% accuracy |
+
+**Experiment 2 detail** — strategy comparison across 12 independent random seeds (full 500-day synthetic data with 15% momentum autocorrelation):
+
+| Metric | Baseline (dual MA crossover) | Loop-discovered (momentum + conviction) |
+|---|---|---|
+| Mean Sharpe | 0.13 | 0.34 |
+| Positive-Sharpe rate | 58% (7/12) | 83% (10/12) |
+| Beats the other | 42% | **58%** |
+
+### What was NOT tested
+
+- **No real LLM sessions were run.** Experiments 1 and 3 use `--simulate` mode (deterministic state-change scripts). Experiment 2 tests the quant strategy directly, not the LLM's ability to discover it.
+- **The quant-lab example state was hand-crafted**, not produced by an actual run of `./run.sh --mode researcher`. A real end-to-end validation (LLM discovers the strategy from scratch) remains future work.
+- **The 12-seed test uses synthetic data** with injected momentum. Real market data would provide a harder test.
+- **No comparison with other agent frameworks** (DGM, OpenHands, etc.) is made here because they solve different problems at different scales — such a comparison would not be apple-to-apple.
+
+### Interpretation
+
+The experiments validate the **orchestration layer**: given an LLM that can improve a strategy, the loop correctly drives it from baseline to target, recovers from dead ends, and stops when appropriate. The open question remains whether the complete system (orchestration + real LLM) produces results that justify its cost in practice. This requires production runs on real projects — contributions welcome.
+
 ## Creating a New Mode
 
 Create `modes/<name>/` with `mode.conf`, `CLAUDE.md`, and `prompts/`. The engine picks up new modes automatically. See [CONTRIBUTING.md](CONTRIBUTING.md).
