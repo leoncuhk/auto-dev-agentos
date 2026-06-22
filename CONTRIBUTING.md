@@ -6,27 +6,27 @@
 git clone https://github.com/leoncuhk/auto-dev-agentos
 cd auto-dev-agentos
 
-# Verify shell engine
-./run.sh --list-modes
-./run.sh --dry-run examples/todo-app
+# Verify harness
+python3 run.py list-modes
+python3 run.py status examples/todo-app
+python3 run.py verify examples/quant-lab --mode researcher
 
-# Run all tests (47 total)
+# Run all tests (54 total)
 python3 tests/test_run.py           # 17 unit tests
-python3 tests/test_integration.py   # 30 integration tests
+python3 tests/test_integration.py   # 37 integration tests
 
-# Test with simulation mode (no LLM calls)
-python3 run.py --simulate --mode researcher --pause 0 examples/quant-lab
+# Test session loop with simulation (no LLM calls)
+python3 run.py loop --simulate --mode researcher --pause 0 examples/quant-lab
 ```
 
 ## Project Structure
 
-- `run.sh` — Shell engine (v3.0, single-loop, 393 lines)
-- `run.py` — SDK engine (v4.1, dual-loop + simulation, 448 lines)
-- `core.py` — Shared pure functions (validation, verification, phase detection)
+- `run.py` — Verification harness CLI (v6.0, subcommands: verify/loop/status, 485 lines)
+- `core.py` — Core verification API + pure functions (251 lines)
 - `modes/<name>/` — Mode-specific logic (conf + CLAUDE.md + prompts)
 - `tests/` — Unit tests + integration tests (no SDK dependency)
 - `docs/` — Design rationale and methodology articles
-- `examples/` — Demo projects (todo-app, quant-lab, audit-demo)
+- `examples/` — Demo projects (todo-app, quant-lab, qlib-quant)
 
 ## Adding a New Mode
 
@@ -51,17 +51,17 @@ python3 run.py --simulate --mode researcher --pause 0 examples/quant-lab
    - `planner.md` (init phase)
    - `worker.md` (work phase)
    - `checker.md` (review phase)
-   - `strategist.md` (orient phase, optional — SDK engine only)
+   - `strategist.md` (orient phase, optional)
 
-4. Test with `--dry-run` and `--simulate`:
+4. Test with subcommands:
    ```bash
-   ./run.sh --mode <name> --dry-run <project-dir>
-   python3 run.py --mode <name> --simulate --pause 0 <project-dir>
+   python3 run.py status <project-dir> --mode <name>
+   python3 run.py verify <project-dir> --mode <name>
+   python3 run.py loop --mode <name> --simulate --pause 0 <project-dir>
    ```
 
 ## Code Style
 
-- Shell: Follow existing `run.sh` patterns. Use `shellcheck`.
 - Python: Standard library only in `core.py` and `run.py` (except `claude-agent-sdk`). No type annotations on existing code unless changing the function.
 - Prompts: Markdown. Include explicit Input, Steps, Rules, and Output sections.
 - Tests: Add tests for any new pure functions. Tests must not require the SDK.
@@ -72,13 +72,12 @@ python3 run.py --simulate --mode researcher --pause 0 examples/quant-lab
 2. Make changes
 3. Run all checks:
    ```bash
-   bash -n run.sh
    python3 -c "import ast; ast.parse(open('run.py').read())"
    python3 -c "import ast; ast.parse(open('core.py').read())"
    python3 tests/test_run.py
    python3 tests/test_integration.py
    ```
-4. Ensure both engines stay under 500 lines each
+4. Ensure run.py stays under 500 lines
 5. Open a PR with a clear description of what changed and why
 
 ## Design Principles
@@ -88,9 +87,8 @@ Before making changes, understand the project's core thesis:
 > Reliability in long-running AI agent tasks comes from system discipline — not from smarter models.
 
 Changes should:
-- Keep both engines minimal (< 500 lines each)
+- Keep the engine minimal (< 500 lines)
 - Not add framework dependencies
-- Maintain backward compatibility (new mode.conf keys must be ignored by run.sh)
 - Prefer file-based state over in-memory state
 - Prefer deterministic orchestration over LLM-driven flow control
 - Include tests that prove the behavior without requiring an LLM

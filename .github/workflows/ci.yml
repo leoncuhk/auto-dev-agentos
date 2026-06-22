@@ -11,8 +11,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: ShellCheck
-        run: shellcheck --severity=error run.sh
       - name: Python syntax
         run: |
           python3 -c "import ast; ast.parse(open('run.py').read())"
@@ -39,8 +37,5 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install jq
-        run: sudo apt-get install -y jq
-      - run: ./run.sh --list-modes
-      - run: ./run.sh --help
-      - run: ./run.sh --dry-run examples/todo-app
+      - run: python3 run.py list-modes
+      - run: python3 run.py status examples/todo-app

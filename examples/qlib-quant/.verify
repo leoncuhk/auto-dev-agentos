@@ -1,0 +1,3 @@
+# Project-level verification commands (overrides mode.conf)
+verify_command=python3 run_qlib_backtest.py --split train
+hidden_verify_command=python3 run_qlib_backtest.py --split test

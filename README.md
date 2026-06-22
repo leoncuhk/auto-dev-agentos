@@ -2,24 +2,114 @@
 
 [![CI](https://github.com/leoncuhk/auto-dev-agentos/actions/workflows/ci.yml/badge.svg)](https://github.com/leoncuhk/auto-dev-agentos/actions) [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%203.0-blue.svg)](LICENSE) [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
-Write a spec. Run the loop. Get a verified project.
+Verify your agent's output. Independently. Automatically.
 
-A minimal [Loop Engineering](https://addyosmani.com/blog/loop-engineering) engine that replaces you as the person prompting the agent. You design the system — the system prompts the LLM, verifies the output, decides what to do next, and stops when done.
+A **verification harness** that wraps around any LLM agent loop. The agent proposes, the harness verifies — with independent commands, hidden out-of-sample data, and structured metric tracking. No frameworks, no Docker, 485 lines of Python.
 
-> **Core thesis**: Reliability in long-running AI agent tasks comes from *system discipline* — deterministic orchestration, stateless sessions, independent verification, hidden out-of-sample validation — not from smarter models.
+> **Core thesis**: Reliability in autonomous AI agent tasks comes from *structurally separate evaluation* — the evaluator must be architecturally independent from the generator. This is [Loop 2](https://blog.langchain.dev/the-art-of-loop-engineering/) in LangChain's stack, and the [non-negotiable principle](https://appscale.com) for production agent systems.
 
 ## What This Is
 
-In the language of Loop Engineering (Osmani 2026, Cherny 2026):
+In the language of [Loop Engineering](https://addyosmani.com/blog/loop-engineering):
 
-- The **outer loop** is `run.sh` / `run.py` — it decides what runs next
-- The **inner loop** is Claude Code — it executes one task per session
-- The **maker** is the LLM session — it writes code or proposes experiments
-- The **checker** is the orchestrator's `verify_command` — it independently validates
-- The **state** lives on disk (`.state/` JSON + markdown) — survives across sessions
-- The **stop conditions** are deterministic — target met, stuck detected, budget exceeded
+| Layer | What | In this project |
+|-------|------|-----------------|
+| **Loop 1** (Agent) | LLM tool-calling loop | Claude Code, /goal, or any agent |
+| **Loop 2** (Verification) | Independent evaluation | **This project** — `verify_command` + `hidden_verify_command` |
+| **Loop 3** (Application) | Session orchestration | `run.py loop` — optional, wraps Loop 1 with Loop 2 |
+| **Loop 4** (Hill Climbing) | Cross-run optimization | Hidden metrics tracking in `.state/hidden_metrics.json` |
 
-You write a spec (or hypothesis, or audit standards). The loop takes over.
+Your agent (Loop 1) already works. This harness adds the verification layer (Loop 2) that production systems need: independent verification commands, hidden out-of-sample validation, and metric accumulation over time.
+
+## Three Ways to Use
+
+### 1. Standalone verification (no LLM calls)
+
+```bash
+# Run verification against your project — verify_command + hidden OOS
+python run.py verify examples/quant-lab --mode researcher
+
+# Check project status
+python run.py status examples/todo-app
+```
+
+### 2. Session loop with verification
+
+```bash
+# Run the full loop: agent sessions + independent verification after each
+python run.py loop examples/todo-app --mode engineer
+
+# Same thing with backward-compatible syntax
+python run.py examples/todo-app
+```
+
+### 3. Library import
+
+```python
+from core import run_verification, load_conf
+
+conf = load_conf(Path("modes/researcher"))
+result = run_verification("/path/to/project", conf, session_label="manual")
+# result = {"verify": {"success": True, "metric": 1.89, ...}, "hidden": {"success": True, ...}}
+```
+
+## Quick Start
+
+```bash
+git clone https://github.com/leoncuhk/auto-dev-agentos
+cd auto-dev-agentos
+
+# See available modes
+python run.py list-modes
+
+# Check status of example project (zero cost)
+python run.py status examples/todo-app
+
+# Run verification only (no LLM calls)
+python run.py verify examples/quant-lab --mode researcher
+
+# Test session loop with simulation (no LLM calls, no cost)
+python run.py loop --simulate --mode engineer --pause 0 examples/todo-app
+
+# Run for real
+mkdir my-project && echo "# My App\nBuild a REST API..." > my-project/spec.md
+python run.py loop my-project
+```
+
+## The Verification Layer
+
+This is the core value of the project. After each work session:
+
+### 1. Independent `verify_command`
+
+Runs a command that the orchestrator controls, not the LLM. Configured in `mode.conf` or overridden per-project with a `.verify` file:
+
+```ini
+# modes/researcher/mode.conf
+verify_command = python run_backtest.py --split train
+
+# examples/qlib-quant/.verify (project-level override)
+verify_command = python qlib_backtest.py --split train
+hidden_verify_command = python qlib_backtest.py --split test
+```
+
+### 2. Hidden out-of-sample validation
+
+`hidden_verify_command` runs on data the LLM never sees. The metric is written to `.state/hidden_metrics.json` but **never fed back** to the LLM — an architectural guarantee, not a prompt-based one.
+
+```json
+[
+  {"session": "1", "metric": 0.84, "timestamp": "2026-06-22T10:00:00+00:00"},
+  {"session": "3", "metric": 1.37, "timestamp": "2026-06-22T10:15:00+00:00"},
+  {"session": "5", "metric": 1.89, "timestamp": "2026-06-22T10:30:00+00:00"}
+]
+```
+
+### 3. Budget & stuck controls
+
+- **Circuit breaker**: stops after N consecutive sessions with no progress
+- **Budget cap**: `--max-budget` prevents runaway spending
+- **Retry**: automatic single retry on error/timeout (don't waste session slots)
 
 ## Architecture
 
@@ -36,160 +126,52 @@ Each session is stateless. State lives in `.state/` files. Session N+1 reads wha
 | State file   | `tasks.json`         | `journal.json`        | `findings.json`          |
 | Verification | `npm test` / `pytest`| Backtest metric       | Coverage count           |
 
-## Quick Start
-
-```bash
-git clone https://github.com/leoncuhk/auto-dev-agentos
-cd auto-dev-agentos
-
-# See what's available
-./run.sh --list-modes
-
-# Preview without invoking Claude (zero cost)
-./run.sh --dry-run examples/todo-app
-
-# Test the loop with simulation (no LLM calls, no cost)
-python run.py --simulate --mode engineer --pause 0 examples/todo-app
-
-# Write a spec, run the engine for real
-mkdir my-project && echo "# My App\nBuild a REST API..." > my-project/spec.md
-./run.sh my-project
-```
-
-## Prerequisites
-
-**Shell engine** (`run.sh`):
-```bash
-brew install jq                         # macOS (or: apt-get install jq)
-npm install -g @anthropic-ai/claude-code # Claude Code CLI
-```
-
-**SDK engine** (`run.py` — adds strategic review, hooks, cost tracking, simulation):
-```bash
-pip install claude-agent-sdk            # Python 3.10+
-```
-
-## Usage
-
-```bash
-# Shell engine
-./run.sh [--mode <mode>] [--dry-run] <project-dir> [max-sessions]
-
-# SDK engine
-python run.py [--mode <mode>] [--dry-run] [--simulate] <project-dir> [options]
-```
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--mode` | `engineer` | `engineer`, `researcher`, or `auditor` |
-| `--dry-run` | | Preview what would run, no LLM calls |
-| `--simulate` | | Use `.state/sim_script.json` for deterministic testing |
-| `--max-sessions` | `50` | Session limit |
-| `--max-budget` | `10.0` | Maximum cost in USD (SDK engine) |
-| `--orient-interval` | `10` | Strategic review interval (SDK engine) |
-
-| Env Variable | Default | Description |
-|-------------|---------|-------------|
-| `PAUSE_SEC` | `5` | Seconds between sessions |
-| `REVIEW_INTERVAL` | `5` | Tactical review every N sessions |
-| `NO_PROGRESS_MAX` | `3` | Stuck detection threshold |
-
-## Example: Researcher Mode
-
-The [quant-lab demo](examples/quant-lab/) shows a complete research run — optimizing a trading strategy's Sharpe Ratio from 0.84 to 1.89 across 6 experiments:
-
-| Experiment | Approach | Result | Decision |
-|-----------|----------|--------|----------|
-| EXP-001 | Optimize MA parameters | 0.84 → 1.37 | Accepted |
-| EXP-002 | MACD confirmation | 1.37 → 0.72 | Rejected (double-lag) |
-| EXP-003 | RSI position sizing | 1.37 → 1.33 | Rejected (fights trend) |
-| EXP-004 | Stop-loss | Error | Reverted (framework limitation) |
-| EXP-005 | Momentum + conviction sizing | 1.37 → 1.89 | Accepted — target exceeded |
-| EXP-006 | Adaptive MA windows | 1.89 → 1.15 | Rejected (boundary instability) |
-
-Failed experiments (002, 003, 004) directly informed the winning experiment (005). The loop works because failures accumulate as knowledge, not waste.
-
-```bash
-cd examples/quant-lab
-python run_backtest.py                    # full data: Sharpe = 1.89
-python run_backtest.py --split train      # visible to LLM: Sharpe = 1.96
-python run_backtest.py --split test       # hidden OOS:     Sharpe = 1.67
-```
-
-The train/test split enables hidden out-of-sample verification — the engine independently validates on data the LLM never sees, preventing overfitting.
-
-## Independent Verification
-
-The engine doesn't trust LLM self-assessment. After each work session:
-
-1. **`verify_command`** (from `mode.conf`) runs independently — the orchestrator checks the result
-2. **`hidden_verify_command`** runs on hidden test data — metric written to `.state/hidden_metrics.json`, never fed back to the LLM
-3. **State validation** — schema checks reject corrupt JSON before write, with automatic backup
-
-This implements the maker-checker split: the LLM proposes, deterministic code verifies.
-
 ## Project Structure
 
 ```
 auto-dev-agentos/
-├── run.sh              # Shell engine (single-loop, 393 lines)
-├── run.py              # SDK engine (dual-loop, simulation, 448 lines)
-├── core.py             # Shared pure functions (validation, verification)
+├── run.py              # Verification harness CLI (485 lines)
+├── core.py             # Pure functions: verification, state, metrics (251 lines)
 ├── modes/
 │   ├── engineer/       # spec.md → tasks → implement → verify
 │   ├── researcher/     # hypothesis.md → experiment → evaluate → learn
 │   └── auditor/        # standards.md → scan → analyze → report
 ├── tests/
 │   ├── test_run.py     # Unit tests (17 tests)
-│   └── test_integration.py  # Integration tests (30 tests)
+│   └── test_integration.py  # Integration tests (37 tests)
 ├── docs/               # Design rationale and methodology
-└── examples/           # Demo projects (todo-app, quant-lab, audit-demo)
+└── examples/           # Demo projects (todo-app, quant-lab, qlib-quant)
 ```
 
-## Experimental Validation
+## CLI Reference
 
-We tested three properties of the loop via simulation and deterministic backtests. Full methodology and code: [`experiments/run_validation.py`](experiments/run_validation.py).
+```
+python run.py verify <project> [--mode MODE]           # verify only
+python run.py loop <project> [--mode MODE] [options]   # session loop
+python run.py status <project> [--mode MODE]           # show phase/progress
+python run.py list-modes                               # list available modes
+python run.py <project> [options]                      # backward compat → loop
+python run.py --dry-run <project>                      # backward compat → status
+```
 
-Run it yourself: `python experiments/run_validation.py`
+| Loop option | Default | Description |
+|-------------|---------|-------------|
+| `--max-sessions` | `50` | Session limit |
+| `--max-budget` | `10.0` | Maximum cost in USD |
+| `--orient-interval` | `10` | Strategic review interval |
+| `--review-interval` | `5` | Tactical review every N sessions |
+| `--no-progress-max` | `3` | Stuck detection threshold |
+| `--pause` | `5` | Seconds between sessions |
+| `--simulate` | | Use `.state/sim_script.json` for deterministic testing |
 
-### What was tested
+## Industry Context
 
-**Experiment 1 — Convergence**: Does the loop reach its target regardless of how many experiments fail along the way? Tested with 4 simulated exploration paths (lucky, typical, hard, pathological).
+This project implements the **structurally separate evaluator** pattern, validated across multiple frameworks:
 
-**Experiment 2 — Generalization**: Does the strategy discovered by the loop (on one data seed) outperform the baseline it started from when tested on 12 different random seeds?
-
-**Experiment 3 — Autonomous correctness**: Does the engine make the right phase decision (init/work/done) across all state configurations, without human input?
-
-### Results
-
-| Hypothesis | Result | Key number |
-|---|---|---|
-| H1: Loop converges on viable paths | **Pass** | 3/3 viable paths reached target; pathological path halted by circuit breaker |
-| H2: Improvement generalizes to unseen data | **Pass** | Loop-discovered strategy beats baseline on 7/12 seeds (58%) |
-| H3: Autonomous decisions are correct | **Pass** | 7/7 scenarios, 100% accuracy |
-
-**Experiment 2 detail** — strategy comparison across 12 independent random seeds (full 500-day synthetic data with 15% momentum autocorrelation):
-
-| Metric | Baseline (dual MA crossover) | Loop-discovered (momentum + conviction) |
-|---|---|---|
-| Mean Sharpe | 0.13 | 0.34 |
-| Positive-Sharpe rate | 58% (7/12) | 83% (10/12) |
-| Beats the other | 42% | **58%** |
-
-### What was NOT tested
-
-- **No real LLM sessions were run.** Experiments 1 and 3 use `--simulate` mode (deterministic state-change scripts). Experiment 2 tests the quant strategy directly, not the LLM's ability to discover it.
-- **The quant-lab example state was hand-crafted**, not produced by an actual run of `./run.sh --mode researcher`. A real end-to-end validation (LLM discovers the strategy from scratch) remains future work.
-- **The 12-seed test uses synthetic data** with injected momentum. Real market data would provide a harder test.
-- **No comparison with other agent frameworks** (DGM, OpenHands, etc.) is made here because they solve different problems at different scales — such a comparison would not be apple-to-apple.
-
-### Interpretation
-
-The experiments validate the **orchestration layer**: given an LLM that can improve a strategy, the loop correctly drives it from baseline to target, recovers from dead ends, and stops when appropriate. The open question remains whether the complete system (orchestration + real LLM) produces results that justify its cost in practice. This requires production runs on real projects — contributions welcome.
-
-## Creating a New Mode
-
-Create `modes/<name>/` with `mode.conf`, `CLAUDE.md`, and `prompts/`. The engine picks up new modes automatically. See [CONTRIBUTING.md](CONTRIBUTING.md).
+- **LangChain** [4-loop stack](https://blog.langchain.dev/the-art-of-loop-engineering/): Agent Loop → Verification Loop → Application Loop → Hill Climbing Loop. This project is Loop 2.
+- **Lanham** L1/L2/L3: Inner (tool-calling) → Task (multi-step goal) → Meta (orchestration). This project operates at L2/L3 boundary.
+- **AppScale** [3 stages](https://appscale.com): Prompt Engineering → Loop Engineering → Orchestrated Teams. Non-negotiable for Stage 2: evaluator must be architecturally separate from generator.
+- **Osmani** [Loop Engineering](https://addyosmani.com/blog/loop-engineering): "Reliability comes from the loop, not the model." The loop is the verification layer.
 
 ## Design Principles
 
@@ -197,34 +179,37 @@ These address the [six failure modes](https://arxiv.org/abs/2601.03315) of auton
 
 | Principle | Failure mode it solves |
 |-----------|----------------------|
+| Independent verification | Overexcitement — orchestrator verifies, not LLM self-report |
+| Hidden OOS validation | Overfitting — test data invisible to the LLM |
 | Stateless sessions | Context degradation — each session starts fresh |
 | File-based state | Context window limits — state survives indefinitely |
 | One task per session | Implementation drift — no room to simplify under pressure |
-| Independent verification | Overexcitement — orchestrator verifies, not LLM self-report |
-| Hidden OOS validation | Overfitting — test data invisible to the LLM |
 | Circuit breaker | Infinite loops — stuck detection + max sessions + budget cap |
 | Deterministic orchestration | All six — code decides flow, not LLM |
 | State schema validation | Corruption — rejects invalid state, auto-backups |
 
+## Prerequisites
+
+```bash
+pip install claude-agent-sdk               # Optional: adds SDK hooks and cost tracking
+npm install -g @anthropic-ai/claude-code   # Claude Code CLI (alternative to SDK)
+```
+
+Either SDK or CLI works. Use `--simulate` to test without either.
+
 ## FAQ
 
 **How much does it cost?**
-Each session is one Claude Code invocation. `--dry-run` previews at zero cost. `--max-budget` caps total spend. `--simulate` runs the full loop with zero LLM calls.
+`verify` subcommand is free (no LLM). Each `loop` session is one Claude Code invocation. `--max-budget` caps total spend.
 
-**How do I test without spending money?**
-Use `--simulate` mode with a `.state/sim_script.json` file. The entire orchestration loop runs identically — only the LLM call is mocked.
-
-**Why `--dangerously-skip-permissions`?**
-Headless mode — no human to click "approve." Safety comes from architecture: deterministic orchestration, one-task blast radius, git-versioned state, circuit breakers.
+**Can I use a different LLM?**
+Yes. The verification layer is LLM-agnostic. Replace the `claude -p` call in `run_cli_session()` with your CLI tool.
 
 **Can I resume after Ctrl+C?**
 Yes. Same command again. The engine re-reads `.state/` and continues from where it left off.
 
-**Can I use a different LLM?**
-Replace `claude -p` in `run.sh` with your CLI tool. The architecture is LLM-agnostic; the current implementation uses Claude.
-
-**What's the relationship to Loop Engineering?**
-This project is a Loop Engineering implementation: it replaces the human who would otherwise prompt the agent at each step. The system autonomously decides what instruction to give the LLM next, based solely on state files.
+**What's the `.verify` file?**
+Project-level override for verification commands. Takes precedence over `mode.conf`. Useful when the same mode applies to different projects with different test suites.
 
 ## References
 
@@ -250,8 +235,6 @@ This project is a Loop Engineering implementation: it replaces the human who wou
 - [GitHub Spec Kit](https://github.com/github/spec-kit) — Spec-driven development toolkit
 - [OpenHands](https://github.com/All-Hands-AI/OpenHands) — Full-platform autonomous coding agent
 - [Omnigent](https://github.com/databricks/omnigent) — Meta-harness for composing agent loops
-- [Aider](https://github.com/Aider-AI/aider) — Interactive AI pair programming
-- [Sakana AI Scientist v2](https://github.com/SakanaAI/AI-Scientist-v2) — Autonomous research via tree search
 
 ## Contributing
 

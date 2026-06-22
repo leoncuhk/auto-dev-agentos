@@ -40,7 +40,7 @@ The same principles apply to AI agent systems. I call this the **Stateless Agent
 
 ```
 ┌────────────────────────────────────────────────────────┐
-│  Deterministic Orchestrator (shell script)             │
+│  Deterministic Orchestrator (run.py)                   │
 │  Decides WHAT runs, WHEN, and with WHAT state          │
 │  ┌──────────────────────────────────────────────────┐  │
 │  │  Session 1        Session 2        Session 3     │  │
@@ -63,11 +63,11 @@ The same principles apply to AI agent systems. I call this the **Stateless Agent
 
 ### Principle 1: Deterministic Orchestration
 
-**The shell script decides the workflow. The LLM executes individual steps.**
+**The orchestrator decides the workflow. The LLM executes individual steps.**
 
 Most agent frameworks let the LLM decide what to do next. This is fundamentally unreliable. An LLM deciding its own workflow is like letting a contractor decide which building code to follow — sometimes they'll get it right, but you can't *depend* on it.
 
-In auto-dev-agentos, a small shell script (`run.sh`) controls the entire execution flow: which phase runs, when to review, when to stop, when to abort. The LLM only sees "here's your task, do it, report the result." The LLM has zero influence on the orchestration logic.
+In auto-dev-agentos, a Python script (`run.py`) controls the entire execution flow: which phase runs, when to review, when to stop, when to abort. The LLM only sees "here's your task, do it, report the result." The LLM has zero influence on the orchestration logic.
 
 This addresses **all six failure modes** at the architectural level — the agent literally cannot drift, loop, or skip steps because the orchestrator won't let it.
 
@@ -211,19 +211,19 @@ git clone https://github.com/leoncuhk/auto-dev-agentos
 cd auto-dev-agentos
 
 # Try engineer mode: write a spec.md, then run
-./run.sh my-project
+python run.py my-project
 
 # Try researcher mode: write a hypothesis.md, then run
-./run.sh --mode researcher my-experiment
+python run.py --mode researcher my-experiment
 
 # Try auditor mode: write a standards.md, then run
-./run.sh --mode auditor my-audit
+python run.py --mode auditor my-audit
 
 # See the quant-lab demo
 cd examples/quant-lab && python run_backtest.py
 ```
 
-The entire system is 334 lines of shell script + markdown prompts. You can read the full source in 15 minutes. There's no framework to learn, no dependencies to install (beyond `claude`, `jq`, and `git`), and no magic.
+The entire system is a single Python script + markdown prompts. You can read the full source in 15 minutes. There's no framework to learn, no dependencies to install (beyond `claude` and `git`), and no magic.
 
 ## Creating Your Own Mode
 

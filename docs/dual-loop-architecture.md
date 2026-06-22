@@ -100,7 +100,7 @@ The v4.0 SDK engine (`run.py`) implements the dual-loop in Python using the Clau
 
 **Pure Python phase detection**: The shell engine depends on `jq` for evaluating mode-specific queries. The SDK engine implements the common patterns (`[.items[] | select(.status == ...)] | length`) in pure Python, eliminating the dependency.
 
-Both engines coexist — `run.sh` for zero-dependency simplicity, `run.py` for the dual-loop and SDK features.
+`run.py` is the single engine, with a CLI fallback mode that works without the Claude Agent SDK installed.
 
 ## When the Outer Loop Matters Most
 
@@ -143,8 +143,8 @@ The strategist prompt should:
 
 | Architecture | Loop type | Exit condition | Orient phase | Best for |
 |---|---|---|---|---|
-| v3.0 (run.sh) | Single convergent | All tasks done / metric reached | Implicit (reviewer) | Well-defined tasks |
-| v4.0 (run.py) | Nested dual-loop | Strategic + tactical | Explicit (strategist) | Uncertain direction |
+| v3.0–v4.0 | Single convergent | All tasks done / metric reached | Implicit (reviewer) | Well-defined tasks |
+| v5.0 (run.py) | Nested dual-loop | Strategic + tactical | Explicit (strategist) | Uncertain direction |
 
 The convergent loop is necessary. The strategic loop makes it reliable even when you start from the wrong direction.
 

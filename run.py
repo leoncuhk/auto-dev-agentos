@@ -1,33 +1,28 @@
 #!/usr/bin/env python3
 """
-auto-dev-agentos v4.0 — SDK-based Dual-Loop Engine
+auto-dev-agentos v6.0 — Verification Harness for LLM Agent Loops
 
-Architecture: Outer OODA loop (strategic) + Inner SDK loop (tactical)
-Coexists with run.sh — same mode system, additional capabilities:
-  - Hooks for safety and audit / Session cost tracking
-  - Pure Python (no jq dependency) / Strategic Orient phase (OODA)
+Structurally separate evaluator (Loop 2) that wraps around any agent loop.
+Independent verification, hidden out-of-sample validation, budget/stuck controls.
 
 Usage:
-  python run.py my-project
-  python run.py --mode researcher examples/quant-lab
-  python run.py --simulate my-project   # deterministic mock via sim_script.json
+  python run.py verify <project-dir> [--mode MODE]      # verify only, no LLM
+  python run.py loop <project-dir> [--mode MODE]         # session loop + verify
+  python run.py status <project-dir>                     # show phase/progress
 """
 
 import asyncio
 import json
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent
-VERSION = "4.1"
+VERSION = "6.0"
 COMPLETE_SIGNAL = "<promise>COMPLETE</promise>"
 
-from core import (
-    load_conf, count_by_status, get_phase, progress_count,
-    run_verify_command, parse_metric, safe_read_state, safe_write_state,
-)
+from core import load_conf, get_phase, progress_count, run_verification
 
 _sdk_available = False
 try:
@@ -200,15 +195,18 @@ async def run_cli_session(
         proc = subprocess.run(
             ["claude", "-p", "--dangerously-skip-permissions", "--output-format", "text"],
             input=prompt_file.read_text(), capture_output=True, text=True,
-            cwd=str(project), timeout=600,
+            cwd=str(project), timeout=900,
         )
-        output = proc.stdout
+        output = proc.stdout or ""
+        stderr = proc.stderr or ""
         result["status"] = "success" if proc.returncode == 0 else "error"
         result["turns"] = 1
         if COMPLETE_SIGNAL in output:
             result["complete"] = True
+        if proc.returncode != 0 and not output:
+            output = f"[claude -p exit code {proc.returncode}]\nSTDERR:\n{stderr}"
     except subprocess.TimeoutExpired:
-        output = ""
+        output = "[TIMEOUT] claude -p exceeded 900s"
         result["status"] = "timeout"
     except Exception as e:
         output = f"ERROR: {e}"
@@ -216,39 +214,8 @@ async def run_cli_session(
 
     log_dir = project / "logs"
     log_dir.mkdir(exist_ok=True)
-    (log_dir / f"session_{label}.log").write_text(output[-5000:])
+    (log_dir / f"session_{label}.log").write_text(output[-10000:])
     return result
-
-
-# ═══════════════════════════════════════════════════════════════
-# Verification — Orchestrator-Enforced
-# ═══════════════════════════════════════════════════════════════
-
-
-def run_post_session_verification(project: Path, conf: dict, phase: str,
-                                  session: int, log_prefix: str = ""):
-    """Run verify_command and hidden_verify_command after work sessions."""
-    if phase != "work":
-        return
-    verify_cmd = conf.get("verify_command", "")
-    if verify_cmd:
-        vr = run_verify_command(str(project), verify_cmd)
-        if not vr["success"]:
-            print(f"{log_prefix}[{ts()}] WARNING: Verification failed "
-                  f"- LLM may have reported false success (exit {vr['exit_code']})")
-    hidden_cmd = conf.get("hidden_verify_command", "")
-    if hidden_cmd:
-        hr = run_verify_command(str(project), hidden_cmd)
-        metrics_path = project / ".state" / "hidden_metrics.json"
-        existing = []
-        if metrics_path.exists():
-            try:
-                existing = json.loads(metrics_path.read_text())
-            except (json.JSONDecodeError, ValueError):
-                existing = []
-        existing.append({"session": session, "metric": hr.get("metric"),
-                         "timestamp": datetime.now(timezone.utc).isoformat()})
-        metrics_path.write_text(json.dumps(existing, indent=2) + "\n")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -259,10 +226,19 @@ def ts() -> str:
     return datetime.now().strftime("%H:%M:%S")
 
 
+async def _dispatch(sim, proj, mdir, conf, phase, label, turns, sscript, sidx):
+    """Route to simulated, SDK, or CLI session."""
+    if sim:
+        return await run_simulated_session(proj, mdir, conf, phase, label, sscript, sidx), sidx + 1
+    if _sdk_available:
+        return await run_session(proj, mdir, conf, phase, label, turns), sidx
+    return await run_cli_session(proj, mdir, conf, phase, label, turns), sidx
+
+
 async def engine(args):
-    """Nested dual-loop: outer OODA (strategic) + inner SDK (tactical)."""
+    """Dual-loop engine: outer OODA (strategic) + inner session (tactical)."""
     simulate = getattr(args, "simulate", False)
-    log_prefix = "[SIMULATE] " if simulate else ""
+    lp = "[SIMULATE] " if simulate else ""
 
     mode_dir = SCRIPT_DIR / "modes" / args.mode
     if not mode_dir.is_dir():
@@ -287,8 +263,6 @@ async def engine(args):
             (project / "CLAUDE.md").write_text(src.read_text())
 
     state_path = project / ".state" / conf.get("state_file", "tasks.json")
-
-    # Load simulation script
     sim_script, sim_idx = [], 0
     if simulate:
         sim_path = project / ".state" / "sim_script.json"
@@ -296,80 +270,34 @@ async def engine(args):
             sys.exit(f"[SIMULATE] No sim_script.json in {project / '.state'}")
         sim_script = json.loads(sim_path.read_text())
 
-    # ── Banner ──
-    print(f"\n  {'='*52}")
-    print(f"       auto-dev-agentos v{VERSION} (SDK Engine)")
-    print(f"    Nested Dual-Loop: OODA x SDK")
-    if simulate:
-        print(f"    [SIMULATE MODE - deterministic mock]")
-    print(f"  {'='*52}\n")
-    print(f"  {log_prefix}Mode    : {args.mode}")
-    print(f"  {log_prefix}Project : {project}")
-    print(f"  {log_prefix}Sessions: max {args.max_sessions} | Budget: ${args.max_budget:.2f}")
-    print(f"  {log_prefix}Review  : every {args.review_interval} | Orient: every {args.orient_interval}\n")
-
-    if args.dry_run:
-        print(f"  [DRY RUN] No agents will be invoked.\n")
-        phase = get_phase(state_path, conf)
-        done = progress_count(state_path, conf)
-        total = done
-        if state_path.exists():
-            try:
-                data = json.loads(state_path.read_text())
-                for key in ["tasks", "experiments", "findings"]:
-                    if key in data:
-                        total = len(data[key])
-                        break
-            except (json.JSONDecodeError, ValueError):
-                pass
-        print(f"  Phase     : {phase}")
-        print(f"  Progress  : {done}/{total} completed")
-        print(f"  Entry file: {entry} {'(exists)' if (project / entry).exists() else '(MISSING)'}")
-        print(f"  State file: {conf.get('state_file', 'tasks.json')} "
-              f"{'(exists)' if state_path.exists() else '(will be created)'}")
-        prompt_name = conf.get(PHASE_KEYS.get(phase, ""), phase)
-        prompt_file = mode_dir / "prompts" / f"{prompt_name}.md"
-        print(f"  Next prompt: {prompt_file.name} {'(exists)' if prompt_file.exists() else '(MISSING)'}")
-        pc = PHASE_CONF.get(phase, PHASE_CONF["default"])
-        print(f"  Tools     : {', '.join(pc['allowed_tools'])}")
-        if pc.get("disallowed_tools"):
-            print(f"  Blocked   : {', '.join(pc['disallowed_tools'])}")
-        return
+    mode_label = f"{'[SIMULATE] ' if simulate else ''}auto-dev-agentos v{VERSION}"
+    print(f"\n  {mode_label} | {args.mode} | max {args.max_sessions} sessions | ${args.max_budget:.0f} budget")
+    print(f"  Project: {project}\n")
 
     session, no_progress, total_cost = 0, 0, 0.0
 
-    # ── Main Loop ──
     while True:
         session += 1
         if session > args.max_sessions:
-            print(f"{log_prefix}[{ts()}] Max sessions ({args.max_sessions}). Stopping.")
+            print(f"{lp}[{ts()}] Max sessions ({args.max_sessions}). Stopping.")
             break
 
         phase = get_phase(state_path, conf)
         if phase == "done":
-            print(f"{log_prefix}[{ts()}] All work complete!")
+            print(f"{lp}[{ts()}] All work complete!")
             break
 
         # ── OODA Orient (strategic review) ──
         if session > 1 and session % args.orient_interval == 0:
-            print(f"\n{log_prefix}[{ts()}] == OODA Orient ==")
-            if simulate:
-                r = await run_simulated_session(
-                    project, mode_dir, conf, "orient", f"orient_{session}",
-                    sim_script, sim_idx)
-                sim_idx += 1
-            elif _sdk_available:
-                r = await run_session(
-                    project, mode_dir, conf, "orient", f"orient_{session}", 15)
-            else:
-                r = await run_cli_session(
-                    project, mode_dir, conf, "orient", f"orient_{session}", 15)
+            print(f"\n{lp}[{ts()}] == OODA Orient ==")
+            r, sim_idx = await _dispatch(simulate, project, mode_dir, conf,
+                                         "orient", f"orient_{session}", 15, sim_script, sim_idx)
             total_cost += r["cost"]
             if r["status"] != "skipped":
-                print(f"{log_prefix}[{ts()}] Orient: {r['status']} | ${r['cost']:.4f}")
+                print(f"{lp}[{ts()}] Orient: {r['status']} | ${r['cost']:.4f}")
             phase = get_phase(state_path, conf)
             if phase == "done":
-                print(f"{log_prefix}[{ts()}] Orient determined: complete!")
+                print(f"{lp}[{ts()}] Orient determined: complete!")
                 break
 
         prev = progress_count(state_path, conf)
@@ -381,66 +309,117 @@ async def engine(args):
                                capture_output=True, timeout=60)
 
         # ── Tactical Session ──
-        print(f"\n{log_prefix}[{ts()}] Session #{session} -- {phase} [{args.mode}]")
-        if simulate:
-            r = await run_simulated_session(
-                project, mode_dir, conf, phase, str(session), sim_script, sim_idx)
-            sim_idx += 1
-        elif _sdk_available:
-            r = await run_session(
-                project, mode_dir, conf, phase, str(session), args.max_turns)
-        else:
-            r = await run_cli_session(
-                project, mode_dir, conf, phase, str(session), args.max_turns)
+        print(f"\n{lp}[{ts()}] Session #{session} -- {phase} [{args.mode}]")
+        r, sim_idx = await _dispatch(simulate, project, mode_dir, conf,
+                                     phase, str(session), args.max_turns, sim_script, sim_idx)
         total_cost += r["cost"]
-        print(f"{log_prefix}[{ts()}] #{session}: {r['status']} | "
+        print(f"{lp}[{ts()}] #{session}: {r['status']} | "
               f"${r['cost']:.4f} | {r['turns']} turns | total ${total_cost:.4f}")
 
         if r["complete"]:
-            print(f"{log_prefix}[{ts()}] Agent confirmed complete!")
+            print(f"{lp}[{ts()}] Agent confirmed complete!")
             break
 
-        # ── Budget Cap ──
         if total_cost >= args.max_budget:
-            print(f"{log_prefix}[{ts()}] Budget cap reached "
-                  f"(${total_cost:.4f} >= ${args.max_budget:.2f}). Stopping.")
+            print(f"{lp}[{ts()}] Budget cap (${total_cost:.4f} >= ${args.max_budget:.2f}). Stopping.")
             break
+
+        # ── Retry on error ──
+        if r["status"] in ("error", "timeout") and not simulate:
+            print(f"{lp}[{ts()}] Session failed ({r['status']}), retrying once...")
+            await asyncio.sleep(10)
+            r, sim_idx = await _dispatch(False, project, mode_dir, conf,
+                                         phase, f"{session}_retry", args.max_turns, sim_script, sim_idx)
+            total_cost += r["cost"]
+            print(f"{lp}[{ts()}] Retry: {r['status']} | ${r['cost']:.4f}")
+            if r["complete"]:
+                print(f"{lp}[{ts()}] Agent confirmed complete!")
+                break
 
         # ── Orchestrator Verification ──
-        run_post_session_verification(project, conf, phase, session, log_prefix)
+        if phase == "work":
+            vr = run_verification(str(project), conf, session_label=str(session))
+            if vr["verify"] and not vr["verify"]["success"]:
+                print(f"{lp}[{ts()}] WARNING: Verification failed "
+                      f"(exit {vr['verify']['exit_code']})")
 
         # ── Circuit Breaker ──
-        if phase == "work":
+        if phase == "work" and r["status"] not in ("error", "timeout"):
             curr = progress_count(state_path, conf)
             if curr <= prev:
                 no_progress += 1
-                print(f"{log_prefix}[{ts()}] No progress ({no_progress}/{args.no_progress_max})")
+                print(f"{lp}[{ts()}] No progress ({no_progress}/{args.no_progress_max})")
                 if no_progress >= args.no_progress_max:
-                    print(f"{log_prefix}[{ts()}] Stuck. Stopping.")
+                    print(f"{lp}[{ts()}] Stuck. Stopping.")
                     break
             else:
                 no_progress = 0
 
         # ── Tactical Review ──
         if session >= args.review_interval and session % args.review_interval == 0:
-            print(f"\n{log_prefix}[{ts()}] == Tactical Review ==")
-            if simulate:
-                r = await run_simulated_session(
-                    project, mode_dir, conf, "review", f"review_{session}",
-                    sim_script, sim_idx)
-                sim_idx += 1
-            elif _sdk_available:
-                r = await run_session(
-                    project, mode_dir, conf, "review", f"review_{session}", 20)
-            else:
-                r = await run_cli_session(
-                    project, mode_dir, conf, "review", f"review_{session}", 20)
+            print(f"\n{lp}[{ts()}] == Tactical Review ==")
+            r, sim_idx = await _dispatch(simulate, project, mode_dir, conf,
+                                         "review", f"review_{session}", 20, sim_script, sim_idx)
             total_cost += r["cost"]
-            print(f"{log_prefix}[{ts()}] Review: {r['status']} | ${r['cost']:.4f}")
+            print(f"{lp}[{ts()}] Review: {r['status']} | ${r['cost']:.4f}")
 
         await asyncio.sleep(args.pause)
 
-    print(f"\n{log_prefix}[{ts()}] Done. {args.mode} | {session} sessions | ${total_cost:.4f}")
+    print(f"\n{lp}[{ts()}] Done. {args.mode} | {session} sessions | ${total_cost:.4f}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# Subcommands
+# ═══════════════════════════════════════════════════════════════
+
+
+def cmd_verify(args):
+    """Run verification only — no LLM calls."""
+    mode_dir = SCRIPT_DIR / "modes" / args.mode
+    if not mode_dir.is_dir():
+        sys.exit(f"Mode '{args.mode}' not found.")
+    conf = load_conf(mode_dir)
+    project = Path(args.project_dir).resolve()
+    if not project.is_dir():
+        sys.exit(f"Project directory not found: {project}")
+    print(f"  auto-dev-agentos v{VERSION} verify | {args.mode}\n  Project: {project}\n")
+    result = run_verification(str(project), conf, session_label="manual")
+    if not result["verify"] and not result["hidden"]:
+        print("  No verify_command or hidden_verify_command configured.")
+        print(f"  Check modes/{args.mode}/mode.conf or {project}/.verify")
+        return
+    ok = all(r["success"] for r in result.values() if r)
+    sys.exit(0 if ok else 1)
+
+
+def cmd_status(args):
+    """Show project phase and progress."""
+    mode_dir = SCRIPT_DIR / "modes" / args.mode
+    if not mode_dir.is_dir():
+        sys.exit(f"Mode '{args.mode}' not found.")
+    conf = load_conf(mode_dir)
+    project = Path(args.project_dir).resolve()
+    state_path = project / ".state" / conf.get("state_file", "tasks.json")
+    entry = conf.get("entry_file", "spec.md")
+    phase = get_phase(state_path, conf)
+    done = progress_count(state_path, conf)
+    prompt_name = conf.get(PHASE_KEYS.get(phase, ""), phase)
+    prompt_file = mode_dir / "prompts" / f"{prompt_name}.md"
+    print(f"  auto-dev-agentos v{VERSION} status | {args.mode}")
+    print(f"  Project: {project}\n")
+    print(f"  Phase:  {phase} | Progress: {done} done")
+    print(f"  Entry:  {entry} {'(OK)' if (project / entry).exists() else '(MISSING)'}")
+    print(f"  State:  {conf.get('state_file','tasks.json')} {'(OK)' if state_path.exists() else '(new)'}")
+    print(f"  Prompt: {prompt_file.name} {'(OK)' if prompt_file.exists() else '(MISSING)'}")
+
+
+def cmd_list_modes(_args):
+    """List available modes."""
+    print("Available modes:")
+    for d in sorted((SCRIPT_DIR / "modes").iterdir()):
+        if d.is_dir():
+            c = load_conf(d)
+            print(f"  {d.name} -- {c.get('description', '(no description)')}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -449,47 +428,57 @@ async def engine(args):
 
 def main():
     import argparse
-    p = argparse.ArgumentParser(
-        description=f"auto-dev-agentos v{VERSION} -- SDK Dual-Loop Engine")
-    p.add_argument("project_dir", nargs="?", help="Project directory")
-    p.add_argument("--mode", default="engineer", help="Execution mode (default: engineer)")
-    p.add_argument("--max-sessions", type=int, default=50)
-    p.add_argument("--max-turns", type=int, default=50, help="Max LLM turns per session")
-    p.add_argument("--max-budget", type=float, default=10.0,
-                   help="Max total cost in USD (default: 10.0)")
-    p.add_argument("--review-interval", type=int, default=5)
-    p.add_argument("--orient-interval", type=int, default=10)
-    p.add_argument("--no-progress-max", type=int, default=3)
-    p.add_argument("--pause", type=int, default=5, help="Seconds between sessions")
-    p.add_argument("--dry-run", action="store_true")
-    p.add_argument("--simulate", action="store_true",
-                   help="Use .state/sim_script.json instead of real LLM calls")
-    p.add_argument("--list-modes", action="store_true")
-    args = p.parse_args()
 
-    if args.list_modes:
-        print("Available modes:")
-        for d in sorted((SCRIPT_DIR / "modes").iterdir()):
-            if d.is_dir():
-                c = load_conf(d)
-                print(f"  {d.name} -- {c.get('description', '(no description)')}")
-        return
+    def _mode(p):
+        p.add_argument("--mode", default="engineer")
 
-    if not args.project_dir:
-        p.print_help()
-        return
+    top = argparse.ArgumentParser(
+        description=f"auto-dev-agentos v{VERSION} — Verification Harness")
+    sub = top.add_subparsers(dest="command")
 
-    if not args.simulate and not args.dry_run and not _sdk_available:
-        # No SDK — fall back to claude CLI (same as run.sh but with verify support)
-        try:
-            subprocess.run(["claude", "--version"], capture_output=True, check=True)
-        except (FileNotFoundError, subprocess.CalledProcessError):
-            sys.exit("Neither claude-agent-sdk nor claude CLI found.\n"
-                     "  Install SDK: pip install claude-agent-sdk\n"
-                     "  Or install CLI: npm install -g @anthropic-ai/claude-code\n"
-                     "  Or use --simulate for testing without either.")
+    p_v = sub.add_parser("verify", help="Run verification only (no LLM)")
+    p_v.add_argument("project_dir"); _mode(p_v)
 
-    asyncio.run(engine(args))
+    p_s = sub.add_parser("status", help="Show phase and progress")
+    p_s.add_argument("project_dir"); _mode(p_s)
+
+    sub.add_parser("list-modes", help="List available modes")
+
+    p_l = sub.add_parser("loop", help="Run session loop with verification")
+    p_l.add_argument("project_dir"); _mode(p_l)
+    for flag, tp, dfl in [("--max-sessions", int, 50), ("--max-turns", int, 50),
+                           ("--max-budget", float, 10.0), ("--review-interval", int, 5),
+                           ("--orient-interval", int, 10), ("--no-progress-max", int, 3),
+                           ("--pause", int, 5)]:
+        p_l.add_argument(flag, type=tp, default=dfl)
+    p_l.add_argument("--simulate", action="store_true")
+
+    # Backward compat: rewrite argv before parsing
+    raw = sys.argv[1:]
+    subcommands = {"verify", "status", "list-modes", "loop"}
+    if raw and raw[0] not in subcommands and raw[0] not in ("-h", "--help"):
+        if "--list-modes" in raw:
+            raw = ["list-modes"]
+        elif "--dry-run" in raw:
+            raw = ["status"] + [a for a in raw if a != "--dry-run"]
+        else:
+            raw = ["loop"] + raw
+    args = top.parse_args(raw)
+    if not args.command:
+        return top.print_help()
+
+    dispatch = {"verify": cmd_verify, "status": cmd_status, "list-modes": cmd_list_modes}
+    if args.command in dispatch:
+        return dispatch[args.command](args)
+    if args.command == "loop":
+        if not getattr(args, "simulate", False) and not _sdk_available:
+            try:
+                subprocess.run(["claude", "--version"], capture_output=True, check=True)
+            except (FileNotFoundError, subprocess.CalledProcessError):
+                sys.exit("Neither claude-agent-sdk nor claude CLI found.\n"
+                         "  pip install claude-agent-sdk  OR  npm i -g @anthropic-ai/claude-code\n"
+                         "  Or use --simulate for testing without either.")
+        asyncio.run(engine(args))
 
 
 if __name__ == "__main__":

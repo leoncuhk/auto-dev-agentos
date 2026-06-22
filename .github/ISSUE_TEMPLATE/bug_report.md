@@ -16,6 +16,6 @@ What should have happened?
 
 ## Environment
 - OS:
-- Engine: run.sh / run.py
+- Engine version:
 - Mode: engineer / researcher / auditor
 - Claude Code version:

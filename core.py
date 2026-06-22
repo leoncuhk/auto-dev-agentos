@@ -1,7 +1,8 @@
 """
-auto-dev-agentos — Pure utility functions.
+auto-dev-agentos — Verification harness core.
 
-Shared by run.py (SDK engine) and tests. No SDK dependency.
+Pure functions for verification, metric parsing, state management, and phase detection.
+Shared by run.py and usable as a library. No SDK dependency.
 """
 
 import json
@@ -30,9 +31,8 @@ def count_by_status(data: dict, jq_query: str) -> int:
     """Evaluate jq-style count queries in pure Python.
 
     Handles: [.array[] | select(.status == "val" or .status == "val2")] | length
-    Limitation: only matches .status field comparisons. Queries filtering on
-    other fields (e.g. .type == "x") will mis-match — use explicit Python
-    query functions for complex modes instead of jq strings.
+    Also checks 'decision' field as fallback when 'status' is absent,
+    since LLMs sometimes use 'decision' instead of 'status' in journal entries.
     """
     m = re.search(r"\.(\w+)\[\]", jq_query)
     if not m:
@@ -41,7 +41,13 @@ def count_by_status(data: dict, jq_query: str) -> int:
     statuses = set(re.findall(r"\.status\s*==\s*\"([^\"]+)\"", jq_query))
     if not statuses:
         statuses = set(re.findall(r'"([^"]+)"', jq_query))
-    return sum(1 for item in items if item.get("status") in statuses)
+    def _matches(item):
+        s = item.get("status", "")
+        if s in statuses:
+            return True
+        d = item.get("decision", "")
+        return any(d == v or d.startswith(v + "(") for v in statuses) if d else False
+    return sum(1 for item in items if _matches(item))
 
 
 def get_phase(state_path: Path, conf: dict) -> str:
@@ -60,6 +66,12 @@ def get_phase(state_path: Path, conf: dict) -> str:
     if count_by_status(data, pending_q) > 0:
         return "work"
 
+    progress_q = conf.get(
+        "progress_query",
+        '[.tasks[] | select(.status == "done")] | length',
+    )
+    done_count = count_by_status(data, progress_q)
+
     best = data.get("best_metric", 0)
     target = data.get("target_metric", 0)
     if target and best >= target:
@@ -67,6 +79,8 @@ def get_phase(state_path: Path, conf: dict) -> str:
     if target and best < target:
         return "init"
 
+    if done_count == 0:
+        return "init"
     return "done"
 
 
@@ -178,3 +192,60 @@ def safe_write_state(state_path: Path, data: dict, mode: str) -> tuple:
     tmp_path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
     os.replace(str(tmp_path), str(state_path))
     return True, None
+
+
+# --- Verification harness (Loop 2) ---
+
+def resolve_verify_cmd(project: Path, conf: dict, key: str) -> str:
+    """Resolve verify command: project .verify file overrides mode.conf."""
+    vf = project / ".verify"
+    if vf.exists():
+        for line in vf.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                if k.strip() == key:
+                    return v.strip()
+    return conf.get(key, "")
+
+
+def run_verification(project_dir: str, conf: dict, session_label: str = "",
+                     verbose: bool = True) -> dict:
+    """Run verify_command and hidden_verify_command independently.
+
+    This is the core value of the harness: structurally separate evaluation.
+    Returns {verify: result|None, hidden: result|None}.
+    """
+    project = Path(project_dir)
+    result = {"verify": None, "hidden": None}
+
+    verify_cmd = resolve_verify_cmd(project, conf, "verify_command")
+    if verify_cmd:
+        vr = run_verify_command(project_dir, verify_cmd, timeout=300)
+        result["verify"] = vr
+        if verbose:
+            status = "PASS" if vr["success"] else "FAIL"
+            metric = f" | metric: {vr['metric']}" if vr.get("metric") is not None else ""
+            print(f"  verify: {status} (exit {vr['exit_code']}){metric}")
+
+    hidden_cmd = resolve_verify_cmd(project, conf, "hidden_verify_command")
+    if hidden_cmd:
+        hr = run_verify_command(project_dir, hidden_cmd, timeout=300)
+        result["hidden"] = hr
+        state_dir = project / ".state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        metrics_path = state_dir / "hidden_metrics.json"
+        existing = []
+        if metrics_path.exists():
+            try:
+                existing = json.loads(metrics_path.read_text())
+            except (json.JSONDecodeError, ValueError):
+                existing = []
+        existing.append({"session": session_label, "metric": hr.get("metric"),
+                         "timestamp": datetime.now(timezone.utc).isoformat()})
+        metrics_path.write_text(json.dumps(existing, indent=2) + "\n")
+        if verbose:
+            status = "PASS" if hr["success"] else "FAIL"
+            print(f"  hidden: {status} (metric written to .state/hidden_metrics.json)")
+
+    return result

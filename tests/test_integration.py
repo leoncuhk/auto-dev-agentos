@@ -7,7 +7,6 @@ based solely on state files — no human in the loop.
 Run: python tests/test_integration.py
 """
 import json
-import os
 import sys
 import tempfile
 from pathlib import Path
@@ -15,7 +14,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from core import (
     count_by_status, get_phase, load_conf, parse_metric, progress_count,
-    run_verify_command, safe_read_state, safe_write_state, validate_state,
+    resolve_verify_cmd, run_verification, run_verify_command,
+    safe_read_state, safe_write_state, validate_state,
 )
 
 SCRIPT_DIR = Path(__file__).parent.parent
@@ -590,6 +590,89 @@ def test_consistency_jq_vs_python():
     for data, query, expected in test_cases:
         result = count_by_status(data, query)
         assert result == expected, f"Query {query[:40]}... expected {expected}, got {result}"
+
+
+# ═══════════════════════════════════════════
+# Group 6: Standalone Verification
+# ═══════════════════════════════════════════
+
+
+def test_run_verification_standalone():
+    """run_verification works without the engine — core value of Loop 2."""
+    with tempfile.TemporaryDirectory() as tmp:
+        python = sys.executable
+        conf = {"verify_command": f"{python} -c \"print('[Metric] sharpe: 1.5'); exit(0)\""}
+        result = run_verification(tmp, conf, session_label="standalone", verbose=False)
+        assert result["verify"] is not None
+        assert result["verify"]["success"] is True
+        assert result["verify"]["metric"] == 1.5
+        assert result["hidden"] is None
+
+
+def test_run_verification_with_hidden():
+    """Hidden verification writes metrics to .state/hidden_metrics.json."""
+    with tempfile.TemporaryDirectory() as tmp:
+        python = sys.executable
+        Path(tmp, ".state").mkdir()
+        conf = {
+            "verify_command": f"{python} -c \"print('[Metric] acc: 0.95')\"",
+            "hidden_verify_command": f"{python} -c \"print('[Metric] oos: 0.82')\"",
+        }
+        result = run_verification(tmp, conf, session_label="s1", verbose=False)
+        assert result["verify"]["success"] is True
+        assert result["verify"]["metric"] == 0.95
+        assert result["hidden"]["success"] is True
+        assert result["hidden"]["metric"] == 0.82
+        metrics = json.loads((Path(tmp) / ".state" / "hidden_metrics.json").read_text())
+        assert len(metrics) == 1
+        assert metrics[0]["session"] == "s1"
+        assert metrics[0]["metric"] == 0.82
+
+
+def test_run_verification_no_commands():
+    """Graceful when no verify commands configured."""
+    with tempfile.TemporaryDirectory() as tmp:
+        result = run_verification(tmp, {}, verbose=False)
+        assert result["verify"] is None
+        assert result["hidden"] is None
+
+
+def test_resolve_verify_cmd_from_conf():
+    """resolve_verify_cmd reads from mode.conf dict."""
+    with tempfile.TemporaryDirectory() as tmp:
+        conf = {"verify_command": "pytest", "hidden_verify_command": "pytest --oos"}
+        assert resolve_verify_cmd(Path(tmp), conf, "verify_command") == "pytest"
+        assert resolve_verify_cmd(Path(tmp), conf, "hidden_verify_command") == "pytest --oos"
+        assert resolve_verify_cmd(Path(tmp), conf, "nonexistent") == ""
+
+
+def test_resolve_verify_cmd_override():
+    """.verify file overrides mode.conf."""
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / ".verify").write_text(
+            "verify_command = bash run_test.sh\nhidden_verify_command = bash oos.sh\n")
+        conf = {"verify_command": "original"}
+        assert resolve_verify_cmd(Path(tmp), conf, "verify_command") == "bash run_test.sh"
+        assert resolve_verify_cmd(Path(tmp), conf, "hidden_verify_command") == "bash oos.sh"
+
+
+def test_verify_exit_code_pass():
+    """Verification passes -> exit code 0 from cmd_verify logic."""
+    with tempfile.TemporaryDirectory() as tmp:
+        python = sys.executable
+        conf = {"verify_command": f"{python} -c \"print('ok')\""}
+        result = run_verification(tmp, conf, verbose=False)
+        assert result["verify"]["success"] is True
+
+
+def test_verify_exit_code_fail():
+    """Verification fails -> structured result shows failure."""
+    with tempfile.TemporaryDirectory() as tmp:
+        python = sys.executable
+        conf = {"verify_command": f"{python} -c \"exit(1)\""}
+        result = run_verification(tmp, conf, verbose=False)
+        assert result["verify"]["success"] is False
+        assert result["verify"]["exit_code"] == 1
 
 
 # ═══════════════════════════════════════════

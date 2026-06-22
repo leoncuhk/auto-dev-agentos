@@ -1,5 +1,34 @@
 # Changelog
 
+## [6.0.0] — 2026-06-22
+
+### Changed
+- **Repositioned as verification harness**: Project identity shifted from "loop engine" to "verification harness" (Loop 2 in LangChain's stack). The core value is structurally separate evaluation, not session orchestration.
+- **Subcommand CLI**: `verify`, `loop`, `status`, `list-modes` subcommands replace flat flags. Full backward compatibility preserved (`python run.py <project>` still works as `loop`).
+- **Public verification API**: `core.run_verification()` and `core.resolve_verify_cmd()` are now the primary entry points — usable standalone without the session loop.
+- **Dispatch refactor**: Extracted `_dispatch()` helper, removing 4x repeated simulate/SDK/CLI dispatch blocks in engine().
+
+### Removed
+- `_resolve_verify_cmd()` and `run_post_session_verification()` from run.py (moved to core.py as public API)
+- `--dry-run` flag (replaced by `status` subcommand, backward compat redirects)
+
+### Added
+- 7 new integration tests (Group 6: Standalone Verification) — total 54 tests
+- README rewritten with Loop 2 positioning, industry context, three usage modes
+
+## [5.0.0] — 2026-06-22
+
+### Changed
+- **Single engine**: Removed `run.sh`. `run.py` is now the sole engine, with CLI fallback mode (no SDK needed)
+- **Robust progress tracking**: `count_by_status` now checks both `status` and `decision` fields, handling LLM state format variations
+- **Session retry**: Failed/timeout sessions get one automatic retry instead of wasting the session slot
+- **Smarter circuit breaker**: Error/timeout sessions no longer count toward the stuck detection threshold
+- **Clean examples**: Reset qlib-quant to baseline state, cleaned goal-vs-loop
+
+### Removed
+- `run.sh` (393 lines) — all functionality subsumed by `run.py` CLI fallback mode
+- `jq` dependency — no longer needed
+
 ## [4.1.0] — 2026-06-21
 
 ### Added

@@ -7,5 +7,6 @@ dist/
 build/
 logs/
 *.log
+mlruns/
 # Runtime artifacts copied into project dirs by the engine
 examples/*/CLAUDE.md

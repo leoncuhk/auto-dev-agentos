@@ -34,19 +34,19 @@ Full platforms with Docker sandboxes, web GUIs, cloud execution. OpenHands has 6
 
 auto-dev-agentos takes a fourth approach:
 
-1. **The shell script decides what runs.** The LLM only executes single, well-scoped tasks.
+1. **The orchestrator script decides what runs.** The LLM only executes single, well-scoped tasks.
 2. **Each session is stateless.** Fresh context every time. No degradation.
 3. **State lives in files.** JSON + markdown, git-versioned, human-readable.
 4. **One task per session.** No room for drift.
 5. **Verification is mandatory.** Tests and metrics decide, not the LLM.
 
-This trades LLM autonomy for system reliability. The model is powerful but unreliable over long horizons. The shell script is simple but deterministic. Combining them produces reliability that neither achieves alone.
+This trades LLM autonomy for system reliability. The model is powerful but unreliable over long horizons. The orchestrator is simple but deterministic. Combining them produces reliability that neither achieves alone.
 
 ## What We Intentionally Do Not Do
 
 - **No inter-agent communication.** Each session talks to files, not to other agents.
 - **No persistent context.** Context windows are ephemeral; only files persist.
-- **No framework dependency.** Shell + markdown + git. Runs anywhere.
+- **No framework dependency.** Python + markdown + git. Runs anywhere.
 - **No web UI.** CLI only. The state files *are* the interface.
 - **No model routing.** One model, deterministically invoked.
 
