@@ -185,6 +185,41 @@ async def run_simulated_session(
     return result
 
 
+async def run_cli_session(
+    project: Path, mode_dir: Path, conf: dict,
+    phase: str, label: str, max_turns: int,
+) -> dict:
+    """Execute one agent session via claude CLI (no SDK needed)."""
+    prompt_name = conf.get(PHASE_KEYS.get(phase, ""), phase)
+    prompt_file = mode_dir / "prompts" / f"{prompt_name}.md"
+    if not prompt_file.exists():
+        return {"status": "skipped", "cost": 0.0, "turns": 0, "complete": False}
+
+    result = {"status": "unknown", "cost": 0.0, "turns": 0, "complete": False}
+    try:
+        proc = subprocess.run(
+            ["claude", "-p", "--dangerously-skip-permissions", "--output-format", "text"],
+            input=prompt_file.read_text(), capture_output=True, text=True,
+            cwd=str(project), timeout=600,
+        )
+        output = proc.stdout
+        result["status"] = "success" if proc.returncode == 0 else "error"
+        result["turns"] = 1
+        if COMPLETE_SIGNAL in output:
+            result["complete"] = True
+    except subprocess.TimeoutExpired:
+        output = ""
+        result["status"] = "timeout"
+    except Exception as e:
+        output = f"ERROR: {e}"
+        result["status"] = "error"
+
+    log_dir = project / "logs"
+    log_dir.mkdir(exist_ok=True)
+    (log_dir / f"session_{label}.log").write_text(output[-5000:])
+    return result
+
+
 # ═══════════════════════════════════════════════════════════════
 # Verification — Orchestrator-Enforced
 # ═══════════════════════════════════════════════════════════════
@@ -323,8 +358,11 @@ async def engine(args):
                     project, mode_dir, conf, "orient", f"orient_{session}",
                     sim_script, sim_idx)
                 sim_idx += 1
-            else:
+            elif _sdk_available:
                 r = await run_session(
+                    project, mode_dir, conf, "orient", f"orient_{session}", 15)
+            else:
+                r = await run_cli_session(
                     project, mode_dir, conf, "orient", f"orient_{session}", 15)
             total_cost += r["cost"]
             if r["status"] != "skipped":
@@ -348,8 +386,11 @@ async def engine(args):
             r = await run_simulated_session(
                 project, mode_dir, conf, phase, str(session), sim_script, sim_idx)
             sim_idx += 1
-        else:
+        elif _sdk_available:
             r = await run_session(
+                project, mode_dir, conf, phase, str(session), args.max_turns)
+        else:
+            r = await run_cli_session(
                 project, mode_dir, conf, phase, str(session), args.max_turns)
         total_cost += r["cost"]
         print(f"{log_prefix}[{ts()}] #{session}: {r['status']} | "
@@ -388,8 +429,11 @@ async def engine(args):
                     project, mode_dir, conf, "review", f"review_{session}",
                     sim_script, sim_idx)
                 sim_idx += 1
-            else:
+            elif _sdk_available:
                 r = await run_session(
+                    project, mode_dir, conf, "review", f"review_{session}", 20)
+            else:
+                r = await run_cli_session(
                     project, mode_dir, conf, "review", f"review_{session}", 20)
             total_cost += r["cost"]
             print(f"{log_prefix}[{ts()}] Review: {r['status']} | ${r['cost']:.4f}")
@@ -436,10 +480,14 @@ def main():
         return
 
     if not args.simulate and not args.dry_run and not _sdk_available:
-        sys.exit("claude-agent-sdk not found.\n"
-                 "  Install: pip install claude-agent-sdk\n"
-                 "  Or use run.sh for the shell-based engine.\n"
-                 "  Or use --simulate for testing without SDK.")
+        # No SDK — fall back to claude CLI (same as run.sh but with verify support)
+        try:
+            subprocess.run(["claude", "--version"], capture_output=True, check=True)
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            sys.exit("Neither claude-agent-sdk nor claude CLI found.\n"
+                     "  Install SDK: pip install claude-agent-sdk\n"
+                     "  Or install CLI: npm install -g @anthropic-ai/claude-code\n"
+                     "  Or use --simulate for testing without either.")
 
     asyncio.run(engine(args))
 
